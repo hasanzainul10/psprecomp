@@ -130,6 +130,9 @@ uint64_t adhoc_real_us(void) { return psp_wall_us(); }
 /* Never 0: a friend's last_recv doubles as its "active" flag. */
 uint64_t adhoc_guest_us(void) { const uint64_t t = psp_sched_now_us(); return t ? t : 1; }
 
+/* The shortest PTP connect wait in PPSSPP-style modes (see ptp_connect). */
+#define ONLINE_CONNECT_US 15000000u
+
 static void nap(void) { psp_sched_sleep_until(psp_sched_now_us() + 1000); }
 
 /* The ad hoc MAC: the install's address with the two low bits of the first
@@ -147,7 +150,15 @@ static const char *ip_text(uint32_t ip_n, char *buf) {
     snprintf(buf, 16, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
     return buf;
 }
+/* With the server on this machine (PPSSPP direct mode), this game's own
+ * loopback address, network order; 0 otherwise. PPSSPP gives each of its
+ * instances 127.0.0.<instance> and binds to it, so the server tells players
+ * apart by address; were this game on plain 127.0.0.1 too, the server would
+ * hand PPSSPP its own address for us. See pick_loopback. */
+static uint32_t g_loop_ip;
+
 static uint32_t local_ip_n(void) {
+    if (g_loop_ip) return g_loop_ip;
     psp_net_host h;
     return psp_net_host_info(&h) && h.ipv4 ? htonl(h.ipv4) : htonl(INADDR_LOOPBACK);
 }
@@ -157,7 +168,10 @@ static int sock_ready(hsock s, int write) {
     FD_ZERO(&f); FD_ZERO(&x);
     FD_SET(s, &f); FD_SET(s, &x);
     struct timeval tv = { 0, 0 };
-    return select((int)s + 1, write ? NULL : &f, write ? &f : NULL, &x, &tv) > 0 && FD_ISSET(s, &f);
+    /* Windows reports a failed non-blocking connect in the exception set,
+     * not the write set: without it a refused connect looked pending forever */
+    return select((int)s + 1, write ? NULL : &f, write ? &f : NULL, &x, &tv) > 0 &&
+           (FD_ISSET(s, &f) || (write && FD_ISSET(s, &x)));
 }
 
 static int sock_error(hsock s) {
@@ -192,6 +206,38 @@ static void split_host_port(const char *in, char *host, size_t cap, uint16_t *po
     }
 }
 
+/* This game's loopback address for a server on this machine: the first of
+ * 127.0.0.16 .. 127.0.0.254 whose matching port (game port 1, the first the
+ * game opens) nothing holds yet. PPSSPP numbers its instances 127.0.0.1, .2,
+ * ... and may not have opened that port yet when we look, so the low ones
+ * are left to it entirely; another copy of this game is skipped by the port
+ * check. */
+#define LOOPBACK_FIRST 16
+static void pick_loopback(void) {
+    for (int n = LOOPBACK_FIRST; n < 255; n++) {
+        const uint32_t ip = htonl(0x7F000000u | (uint32_t)n);
+        hsock s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s == BAD_SOCK) break;
+        struct sockaddr_in b;
+        memset(&b, 0, sizeof b);
+        b.sin_family = AF_INET;
+        b.sin_addr.s_addr = ip;
+        b.sin_port = htons((uint16_t)(1 + g_offset));
+        const int free_here = bind(s, (struct sockaddr *)&b, sizeof b) == 0;
+        close_sock(s);
+        if (!free_here) continue;
+        g_loop_ip = ip;
+        char t[16];
+        adhoc_log("the server is on this machine: playing as %s (PPSSPP instances use 127.0.0.1, .2, ...)", ip_text(ip, t));
+        return;
+    }
+    adhoc_log("the server is on this machine, but no loopback address is free; using 127.0.0.1");
+}
+
+/* Bind addresses: this game's loopback address when the server is local
+ * (see g_loop_ip), else any. */
+static void bind_local(struct sockaddr_in *b) { if (g_loop_ip) b->sin_addr.s_addr = g_loop_ip; }
+
 static void resolve_server(void) {
     const int modern = g_mode == PSP_ADHOC_MODE_MODERN;
     char host[256];
@@ -204,11 +250,15 @@ static void resolve_server(void) {
     snprintf(g_cur_name, sizeof g_cur_name, "%s", host);
     if (modern && (!host[0] || !strcmp(host, "host") || !strcmp(host, "self"))) {
         if (psp_adhoc_server_start(g_cur_port, g_cur_relay, server_log) != 0) {
-            adhoc_log("modern: the built-in server could not start; nothing will connect");
-            return;
+            /* the port is taken: most likely a server already runs on this
+             * machine (modern_server.exe, another game window); use that one */
+            adhoc_log("modern: port %u is taken by another program here; joining the server already "
+                      "listening on it (close that program to host from this game)", g_cur_port);
+            snprintf(g_cur_name, sizeof g_cur_name, "the server already on this machine");
+        } else {
+            snprintf(g_cur_name, sizeof g_cur_name, "this game (built-in server)");
         }
         snprintf(host, sizeof host, "127.0.0.1");
-        snprintf(g_cur_name, sizeof g_cur_name, "this game (built-in server)");
     }
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof hints);
@@ -220,6 +270,10 @@ static void resolve_server(void) {
         g_server_ip = res->ai_family == AF_INET ? ((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr : 1;
         freeaddrinfo(res);
     }
+    g_loop_ip = 0;
+    /* PPSSPP direct only: relay and modern traffic goes through the server */
+    if (g_mode == PSP_ADHOC_MODE_PPSSPP_DIRECT && g_srv.ss_family == AF_INET && ((const uint8_t *)&g_server_ip)[0] == 127)
+        pick_loopback();
     char ip[64] = "";
     if (g_srv.ss_family == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&g_srv)->sin6_addr, ip, sizeof ip);
     else if (g_server_ip) ip_text(g_server_ip, ip);
@@ -245,6 +299,13 @@ static hsock tcp_connect_server(uint16_t port) {
     set_nonblocking(s);
     const int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+    if (g_loop_ip && a.ss_family == AF_INET) {     /* the server sees us at our loopback address */
+        struct sockaddr_in b;
+        memset(&b, 0, sizeof b);
+        b.sin_family = AF_INET;
+        bind_local(&b);
+        if (bind(s, (struct sockaddr *)&b, sizeof b) != 0) adhoc_log("cannot bind the server connection to the loopback address");
+    }
     if (connect(s, (struct sockaddr *)&a, len) != 0 && !IN_PROGRESS(last_error())) { close_sock(s); return BAD_SOCK; }
     return s;
 }
@@ -426,7 +487,8 @@ static uint32_t resolve_mac(const uint8_t mac[6]) {
     return f >= 0 ? g_friends[f].ip : 0;
 }
 static int resolve_ip(uint32_t ip, uint8_t mac[6]) {
-    if (ip == local_ip_n() || ip == htonl(INADDR_LOOPBACK)) { adhoc_local_mac(mac); return 1; }
+    /* 127.0.0.1 is us, unless the server is local: then it is PPSSPP's first instance */
+    if (ip == local_ip_n() || (!g_loop_ip && ip == htonl(INADDR_LOOPBACK))) { adhoc_local_mac(mac); return 1; }
     for (int i = 0; i < MAX_FRIENDS; i++)
         if (g_friends[i].used && g_friends[i].ip == ip) { memcpy(mac, g_friends[i].mac, 6); return 1; }
     return 0;
@@ -478,6 +540,7 @@ static void meta_packets(void) {
             }
             int f = friend_find(p + 129);
             if (f < 0) for (int i = 0; i < MAX_FRIENDS; i++) if (!g_friends[i].used) { f = i; break; }
+            if (f < 0) for (int i = 0; i < MAX_FRIENDS; i++) if (!g_friends[i].last_recv) { f = i; break; }   /* a player who left */
             if (f >= 0) {
                 g_friends[f].used = 1;
                 memcpy(g_friends[f].mac, p + 129, 6);
@@ -489,21 +552,27 @@ static void meta_packets(void) {
             }
             break;
         }
+        /* A player who left stays known, only inactive (last_recv 0: out of the
+         * peer list and broadcasts), as in the reference's deleteFriendByIP:
+         * a host leaving the lobby group to open its room still sends to its
+         * children, who must follow it there. Removing the entry made those
+         * packets "not a player" -- dropped -- and the children timed the
+         * host out instead of following (kicked when the host started). */
         case OP_DISCONNECT: {
             uint32_t a;
             memcpy(&a, p + 1, 4);
             for (int i = 0; i < MAX_FRIENDS; i++)
-                if (g_friends[i].used && g_friends[i].ip == a) {
+                if (g_friends[i].used && g_friends[i].ip == a && g_friends[i].last_recv) {
                     adhoc_log("player %s left", g_friends[i].nick);
-                    g_friends[i].used = 0;
+                    g_friends[i].last_recv = 0;
                 }
             break;
         }
         case OP_DISCONNECT_MAC:
             for (int i = 0; i < MAX_FRIENDS; i++)
-                if (g_friends[i].used && !memcmp(g_friends[i].mac, p + 1, 6)) {
+                if (g_friends[i].used && !memcmp(g_friends[i].mac, p + 1, 6) && g_friends[i].last_recv) {
                     adhoc_log("player %s left", g_friends[i].nick);
-                    g_friends[i].used = 0;
+                    g_friends[i].last_recv = 0;
                 }
             break;
         case OP_SCAN:
@@ -636,11 +705,12 @@ typedef struct {
     /* modern (adhoc_mesh.c) */
     int mesh, sid;
     uint64_t tx, rx;                     /* game bytes, for the log */
-    /* relay: a connect the game gave up on, kept for its retry (see hle_PtpClose) */
+    /* relay / direct: a connect the game gave up on, kept for its retry (see hle_PtpClose) */
     int parked;
     uint64_t parked_at;
-    /* relay / modern: a connection to ourselves, paired in-process (see local_connect) */
+    /* a connection to ourselves, paired in-process (see local_connect) */
     int local, lpeer, lwant;
+    int long_wait;                       /* the connect timeout was lengthened (logged once) */
 } asock;
 
 static asock g_s[MAX_SOCK];
@@ -753,11 +823,12 @@ static void sockets_pump(void) {
     const uint64_t now = adhoc_real_us();
     for (int i = 0; i < MAX_SOCK; i++) {
         asock *a = &g_s[i];
-        if (!a->used || !a->relay) continue;
-        relay_io(a);
+        if (!a->used) continue;
+        if (a->relay) relay_io(a);
         /* a kept connect nobody came back for */
         if (a->parked && (a->rdead || now - a->parked_at > (a->state == PTP_ESTABLISHED ? 10000000u : 30000000u))) {
-            adhoc_log("ptp %d: dropping the kept relay connect (%s)", i + 1, a->rdead ? "the relay closed it" : "not retried");
+            adhoc_log("ptp %d: dropping the kept %s connect (%s)", i + 1, a->relay ? "relay" : "direct",
+                      a->rdead ? "the relay closed it" : "not retried");
             if (a->s != BAD_SOCK) close_sock(a->s);
             buf_free(&a->rin); buf_free(&a->rout); buf_free(&a->stream);
             memset(a, 0, sizeof *a);
@@ -1209,6 +1280,7 @@ static int pdp_create(uint8_t mac[6], int port, int bufsize, int flag) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
+    bind_local(&addr);
     uint16_t want = (uint16_t)(port + g_offset);
     if (!want && port > 0) want = 65535;
     addr.sin_port = htons(want);
@@ -1234,6 +1306,21 @@ static void hle_PdpCreate(void) {
 }
 
 /* One datagram to one peer. 0 sent, 1 would block, -1 failed. */
+/* Direct mode: the first UDP datagram to and from each address is logged
+ * (address, port, size, and for arrivals whether a player of the group sent
+ * it), so a log shows whether anything crosses the NAT in either direction. */
+static void pdp_note(int sent, uint32_t ip, uint16_t port_h, int len, int known) {
+    static struct { uint32_t ip; uint16_t port; uint8_t sent; } seen[64];
+    static int n;
+    for (int i = 0; i < n; i++)
+        if (seen[i].ip == ip && seen[i].port == port_h && seen[i].sent == (uint8_t)sent) return;
+    if (n < 64) { seen[n].ip = ip; seen[n].port = port_h; seen[n].sent = (uint8_t)sent; n++; }
+    char t[16];
+    if (sent) adhoc_log("udp: first datagram to %s:%u (%d bytes%s)", ip_text(ip, t), port_h, len, known < 0 ? ", send failed" : "");
+    else adhoc_log("udp: first datagram from %s:%u (%d bytes)%s", ip_text(ip, t), port_h, len,
+                   known ? "" : " -- not a player the server listed: dropped");
+}
+
 static int pdp_send_one(asock *a, const uint8_t mac[6], uint16_t port, const void *data, int len) {
     if (a->mesh) { mesh_pdp_send(mac, a->lport, port, data, len); return 0; }   /* unknown peer: success, as below */
     if (a->relay) {
@@ -1259,6 +1346,7 @@ static int pdp_send_one(asock *a, const uint8_t mac[6], uint16_t port, const voi
     t.sin_addr.s_addr = ip;
     t.sin_port = htons((uint16_t)(port + g_offset));
     const int n = sendto(a->s, (const char *)data, len, 0, (struct sockaddr *)&t, sizeof t);
+    pdp_note(1, ip, (uint16_t)(port + g_offset), len, n >= 0 ? 1 : -1);
     if (n >= 0) return 0;
     return WOULD_BLOCK(last_error()) ? 1 : -1;
 }
@@ -1341,7 +1429,9 @@ static uint32_t pdp_recv_try(asock *a, uint8_t mac[6], uint16_t *port, uint8_t *
 #endif
             return WOULD_BLOCK(e) ? ADHOC_WOULD_BLOCK : ADHOC_TIMEOUT;
         }
-        if (!resolve_ip(from.sin_addr.s_addr, mac)) {          /* not a player of this group: drop */
+        const int known = resolve_ip(from.sin_addr.s_addr, mac);
+        pdp_note(0, from.sin_addr.s_addr, ntohs(from.sin_port), n, known);
+        if (!known) {                                          /* not a player of this group: drop */
             recvfrom(a->s, (char *)peek, sizeof peek, 0, NULL, NULL);
             continue;
         }
@@ -1489,7 +1579,7 @@ static int ptp_port_in_use(uint16_t port, int listen, const uint8_t *dmac, uint1
 /* A non-blocking connect attempt. 0 = established, 1 = in progress, else an error. */
 static uint32_t ptp_connect_try(asock *a) {
     if (a->state == PTP_ESTABLISHED) return 0;
-    if ((g_relay || g_mesh) && adhoc_is_local_mac(a->paddr)) return local_connect(a);
+    if (adhoc_is_local_mac(a->paddr)) return local_connect(a);
     if (a->mesh) {
         if (!a->sid) {
             a->sid = mesh_stream_open(a->paddr, a->lport, a->pport);
@@ -1527,7 +1617,19 @@ static uint32_t ptp_connect_try(asock *a) {
         const int e = sock_error(a->s);
         struct sockaddr_in pn;
         socklen_t pl = sizeof pn;
-        if (!e && getpeername(a->s, (struct sockaddr *)&pn, &pl) == 0) { a->state = PTP_ESTABLISHED; return 0; }
+        if (!e && getpeername(a->s, (struct sockaddr *)&pn, &pl) == 0) {
+            char t[16];
+            adhoc_log("ptp %d: connected to %s:%u after %.1f s", (int)(a - g_s) + 1, ip_text(ip, t),
+                      a->pport + g_offset, (double)(adhoc_real_us() - a->rstart) / 1e6);
+            a->state = PTP_ESTABLISHED;
+            return 0;
+        }
+        if (a->attempts == 1 || a->attempts % 20 == 0) {
+            char t[16];
+            adhoc_log("ptp %d: %s:%u refused the connect (error %d, attempt %d) -- nothing listening there? "
+                      "Both sides need the same port offset (here %u)", (int)(a - g_s) + 1, ip_text(ip, t),
+                      a->pport + g_offset, e, a->attempts, g_offset);
+        }
         a->state = PTP_CLOSED;                         /* refused: recreate and retry */
     }
     if (a->state == PTP_CLOSED) {
@@ -1542,6 +1644,7 @@ static uint32_t ptp_connect_try(asock *a) {
             struct sockaddr_in b;
             memset(&b, 0, sizeof b);
             b.sin_family = AF_INET;
+            bind_local(&b);
             b.sin_port = htons((uint16_t)(a->lport + g_offset));
             bind(a->s, (struct sockaddr *)&b, sizeof b);
         }
@@ -1550,9 +1653,18 @@ static uint32_t ptp_connect_try(asock *a) {
         t.sin_family = AF_INET;
         t.sin_addr.s_addr = ip;
         t.sin_port = htons((uint16_t)(a->pport + g_offset));
+        if (!a->rstart) {
+            char ts[16];
+            a->rstart = adhoc_real_us();
+            adhoc_log("ptp %d: connecting to %s:%u (TCP)", (int)(a - g_s) + 1, ip_text(ip, ts), a->pport + g_offset);
+        }
         if (connect(a->s, (struct sockaddr *)&t, sizeof t) == 0) { a->state = PTP_ESTABLISHED; return 0; }
         const int e = last_error();
-        if (!IN_PROGRESS(e)) return ADHOC_CONNECTION_REFUSED;
+        if (!IN_PROGRESS(e)) {
+            char ts[16];
+            adhoc_log("ptp %d: connect to %s:%u failed at once (error %d)", (int)(a - g_s) + 1, ip_text(ip, ts), a->pport + g_offset, e);
+            return ADHOC_CONNECTION_REFUSED;
+        }
         a->state = PTP_SYN_SENT;
     }
     return 1;
@@ -1565,6 +1677,14 @@ static uint32_t ptp_connect(uint32_t id, uint32_t timeout, int flag) {
     if (a->flags & F_ALERTCONNECT) { a->alerted |= F_ALERTCONNECT; return ADHOC_SOCKET_ALERTED; }
     if (a->state == PTP_ESTABLISHED) return 0;         /* PSP2i connects again after success */
     if (a->state != PTP_CLOSED && a->state != PTP_SYN_SENT) return ADHOC_NOT_OPENED;
+    /* The game's timeout is made for a LAN (about 2 s); over the internet a
+     * connect (and the relay's setup) can take longer, so PPSSPP-style modes
+     * wait at least ONLINE_CONNECT_US. Only this PSP thread waits. */
+    if (timeout && timeout < ONLINE_CONNECT_US && !a->mesh && !adhoc_is_local_mac(a->paddr)) {
+        if (!a->long_wait) adhoc_log("ptp %u: connect timeout %.1f s -> %.0f s (online)", id, timeout / 1e6, ONLINE_CONNECT_US / 1e6);
+        a->long_wait = 1;
+        timeout = ONLINE_CONNECT_US;
+    }
     const uint64_t end = timeout ? adhoc_real_us() + timeout : 0;
     for (;;) {
         const uint32_t r = ptp_connect_try(a);
@@ -1601,7 +1721,7 @@ static void hle_PtpOpen(void) {
     if (g_cur_mode < 0 || !srcmac || !dstmac || is_broadcast(dst) || is_zero(dst)) { psp_ret(ADHOC_INVALID_ADDR); return; }
     if (ptp_port_in_use((uint16_t)sport, 0, dst, (uint16_t)dport)) { psp_ret(ADHOC_PORT_IN_USE); return; }
     if (bufsize <= 0 || rexmt_int <= 0 || rexmt_cnt <= 0) { psp_ret(ADHOC_INVALID_ARG); return; }
-    if (g_relay) {                                      /* the retry of a connect kept by hle_PtpClose */
+    if (!g_mesh) {                                      /* the retry of a connect kept by hle_PtpClose */
         for (int i = 0; i < MAX_SOCK; i++) {
             asock *k = &g_s[i];
             if (!k->used || !k->parked || memcmp(k->paddr, dst, 6) || k->pport != (uint16_t)dport) continue;
@@ -1610,8 +1730,8 @@ static void hle_PtpOpen(void) {
             k->nonblock = flag; k->bufsize = (uint32_t)bufsize; k->retry_int = rexmt_int; k->retry_cnt = rexmt_cnt;
             k->tx = k->rx = 0;
             char m[18];
-            adhoc_log("ptp %d: open port %u -> %s:%u (relay), continuing the kept connect (%.1f s so far%s)", i + 1, k->lport,
-                      mac_text(dst, m), k->pport, (double)(adhoc_real_us() - k->rstart) / 1e6,
+            adhoc_log("ptp %d: open port %u -> %s:%u (%s), continuing the kept connect (%.1f s so far%s)", i + 1, k->lport,
+                      mac_text(dst, m), k->pport, k->relay ? "relay" : "direct", (double)(adhoc_real_us() - k->rstart) / 1e6,
                       k->state == PTP_ESTABLISHED ? ", already connected" : "");
             psp_ret((uint32_t)(i + 1));
             return;
@@ -1643,6 +1763,7 @@ static void hle_PtpOpen(void) {
         struct sockaddr_in b;
         memset(&b, 0, sizeof b);
         b.sin_family = AF_INET;
+        bind_local(&b);
         uint16_t want = (uint16_t)(sport + g_offset);
         if (!want && sport > 0) want = 65535;
         b.sin_port = htons(want);
@@ -1705,6 +1826,7 @@ static void hle_PtpListen(void) {
     struct sockaddr_in b;
     memset(&b, 0, sizeof b);
     b.sin_family = AF_INET;
+    bind_local(&b);
     uint16_t want = (uint16_t)(sport + g_offset);
     if (!want && sport > 0) want = 65535;
     b.sin_port = htons(want);
@@ -1995,6 +2117,17 @@ static void hle_PtpClose(void) {
         a->parked_at = adhoc_real_us();
         char m[18];
         adhoc_log("ptp %u: closed while the relay was still connecting it to %s:%u (%.1f s); kept for the retry",
+                  psp_arg(0), mac_text(a->paddr, m), a->pport, (double)(a->parked_at - a->rstart) / 1e6);
+        psp_ret(0);
+        return;
+    }
+    if (!a->relay && !a->mesh && !a->local && a->rstart && a->state == PTP_SYN_SENT && a->s != BAD_SOCK) {
+        /* the same for a direct TCP connect still under way (rstart: one was
+         * started; a connection to ourselves never starts one) */
+        a->parked = 1;
+        a->parked_at = adhoc_real_us();
+        char m[18];
+        adhoc_log("ptp %u: closed while still connecting directly to %s:%u (%.1f s); kept for the retry",
                   psp_arg(0), mac_text(a->paddr, m), a->pport, (double)(a->parked_at - a->rstart) / 1e6);
         psp_ret(0);
         return;

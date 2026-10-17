@@ -151,11 +151,23 @@ static void self_ip6(char *out, size_t cap) {
 }
 
 /* A listening socket: IPv6 accepting IPv4 too, else IPv4 only. */
+/* Only one listener per port. Windows' SO_REUSEADDR would let a second
+ * program (another game window, modern_server.exe) bind the same port without
+ * an error and take the connections meant for this one. */
+static void exclusive(hsock s) {
+    const int one = 1;
+#ifdef _WIN32
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof one);
+#else
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+#endif
+}
+
 static hsock listen_on(uint16_t port) {
-    const int one = 1, zero = 0;
+    const int zero = 0;
     hsock s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (s != BAD_SOCK) {
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+        exclusive(s);
         setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&zero, sizeof zero);
         struct sockaddr_in6 a;
         memset(&a, 0, sizeof a);
@@ -167,7 +179,7 @@ static hsock listen_on(uint16_t port) {
     }
     s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == BAD_SOCK) return BAD_SOCK;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+    exclusive(s);
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;

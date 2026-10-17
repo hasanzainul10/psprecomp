@@ -54,6 +54,9 @@ static uint32_t call(const char *name, uint32_t a0, uint32_t a1, uint32_t a2, ui
 
 #define G 0x08900000u
 #define BOB_IP 0x7F000002u
+/* The library itself, with the server on this machine in direct mode: its own
+ * loopback address, clear of PPSSPP's 127.0.0.1, .2, ... (adhoc.c pick_loopback). */
+#define US_IP 0x7F000010u
 static const uint8_t BOB[6] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
 static const uint8_t HOSTMAC[6] = { 0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE };
 #define WRONG_PORT_NEVER 0
@@ -162,7 +165,7 @@ static void test_direct(hsock ls) {
     hsock bobu = udp_at(BOB_IP, 13001);
     struct sockaddr_in to;
     memset(&to, 0, sizeof to);
-    to.sin_family = AF_INET; to.sin_addr.s_addr = htonl(0x7F000001u); to.sin_port = htons(13000);
+    to.sin_family = AF_INET; to.sin_addr.s_addr = htonl(US_IP); to.sin_port = htons(13000);
     sendto(bobu, "hello", 5, 0, (struct sockaddr *)&to, sizeof to);
     pump_ms(100);
     psp_write32(G + 0x310, 64);

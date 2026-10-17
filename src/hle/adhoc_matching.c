@@ -23,6 +23,7 @@
 #include "psprecomp/net.h"
 #include "adhoc.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -238,10 +239,36 @@ static void send_bye(mctx *c) {
         if (p->state == P_PARENT || p->state == P_CHILD || p->state == P_P2P || p->state == P_CANCELLING) send_to(c, p->mac, &b, 1);
 }
 
+/* ---- the log: what the join handshake did (PING/HELLO only once per peer) ---- */
+
+static const char *const PK_NAME[] = { "PING", "HELLO", "JOIN", "ACCEPT", "CANCEL", "BULK", "BULK_ABORT", "BIRTH", "DEATH", "BYE" };
+static const char *const EV_NAME[] = { "?", "HELLO", "REQUEST", "LEAVE", "DENY", "CANCEL", "ACCEPT", "ESTABLISHED",
+                                       "TIMEOUT", "ERROR", "BYE", "DATA", "DATA_ACK", "DATA_TIMEOUT" };
+static const char *mtext(const uint8_t m[6], char *b) {
+    snprintf(b, 18, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+    return b;
+}
+/* Once per (context, peer, kind) for the repeating ones. */
+static int log_once(int id, const uint8_t mac[6], int kind) {
+    static struct { int id, kind; uint8_t mac[6]; } seen[64];
+    static int n;
+    for (int i = 0; i < n; i++)
+        if (seen[i].id == id && seen[i].kind == kind && !memcmp(seen[i].mac, mac, 6)) return 0;
+    if (n < 64) { seen[n].id = id; seen[n].kind = kind; memcpy(seen[n].mac, mac, 6); n++; }
+    return 1;
+}
+static void log_pk(mctx *c, int sent, int op, const uint8_t mac[6], int len) {
+    if ((op == PK_PING || op == PK_HELLO) && !log_once(c->id, mac, op * 2 + sent)) return;
+    char b[18];
+    adhoc_log("matching %d: %s %s %s %s (%d bytes)%s", c->id, sent ? "sent" : "got", op >= 0 && op <= PK_BYE ? PK_NAME[op] : "?",
+              sent ? "to" : "from", mtext(mac, b), len, op == PK_PING || op == PK_HELLO ? " (first; repeats not logged)" : "");
+}
+
 static void flush_inputs(mctx *c) {
     while (c->inputs) {
         mmsg *m = c->inputs;
         c->inputs = m->next;
+        if (m->opcode != PK_PING) log_pk(c, 1, m->opcode, m->mac, m->optlen);
         switch (m->opcode) {
         case PK_ACCEPT: send_accept(c, m->mac, m->optlen, m->opt); break;
         case PK_JOIN: {
@@ -408,6 +435,12 @@ static void deliver_events(mctx *c) {
             free(m);                                    /* no HELLO in the middle of a join (as the reference) */
             continue;
         }
+        if (m->opcode != EV_HELLO || log_once(c->id, m->mac, 100)) {
+            char b[18];
+            adhoc_log("matching %d: event %s for %s (%d bytes)%s", c->id,
+                      m->opcode > 0 && m->opcode <= EV_DATA_TIMEOUT ? EV_NAME[m->opcode] : "?", mtext(m->mac, b), m->optlen,
+                      m->opcode == EV_HELLO ? " (first; repeats not logged)" : "");
+        }
         const uint32_t buf = adhoc_guest_alloc(8u + (uint32_t)m->optlen);
         if (buf && c->handler) {
             psp_mem_write_block(buf, m->mac, 6);
@@ -441,6 +474,7 @@ void adhoc_matching_tick(void) {
             int len = c->rxbuflen;
             if (adhoc_pdp_recv_internal(c->socket, mac, &port, c->rxbuf, &len) != 0 || len <= 0) break;
             set_peer_port(c, mac, port);
+            log_pk(c, 0, c->rxbuf[0], mac, len);
             switch (c->rxbuf[0]) {
             case PK_PING:   { mpeer *p = find_peer(c, mac); if (p) p->lastping = adhoc_real_us(); break; }
             case PK_HELLO:  on_hello(c, mac, len); break;
@@ -593,6 +627,10 @@ static void hle_SelectTarget(void) {
         else if (c->mode == MODE_P2P && p->state == P_INCOMING) { p->state = P_P2P; input(c, PK_ACCEPT, mac, optlen, opt); r = 0; }
     }
     free(opt);
+    {
+        char b[18];
+        adhoc_log("matching %d: game selects %s (state %d) -> 0x%08X", id, mtext(mac, b), p->state, r);
+    }
     psp_ret(r);
 }
 

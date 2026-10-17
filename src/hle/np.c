@@ -111,13 +111,33 @@ static void hle_NpCommerce2Term(void) { g_commerce_inited = 0; psp_ret(0); }
 /* ---- sceUtilityPsn* (PSP2i's PSN sign-in) ------------------------------------------------- */
 
 static int g_psn_active, g_psn_status = PSN_ERROR, g_psn_reported;
+static int (*g_store_open)(const char *title_id);
+static int (*g_store_showing)(void);
+static int g_store_up;                   /* the host's store page is over the game */
+void psp_np_set_store(int (*open)(const char *title_id), int (*showing)(void)) { g_store_open = open; g_store_showing = showing; }
 
 static void hle_PsnInitStart(void) {
     const uint32_t p = psp_arg(0);
     char title[32] = "";
     if (p) psp_str(psp_read32(p + 0x30 + 0x18), title, sizeof title);       /* titleIdPtr */
-    np_log("PSN sign-in requested (mode %u, title \"%s\")", p ? psp_read32(p + 0x30) : 0, title);
+    const uint32_t mode = p ? psp_read32(p + 0x30) : 0;
+    np_log("PSN sign-in requested (mode %u, title \"%s\")", mode, title);
     g_psn_reported = -1;
+    /* Mode 1 comes from PSP2i's "PS Store" option (after sceNpCommerce2Init):
+     * the firmware's store, which Sony closed. It is answered like a sign-in
+     * on purpose: the game takes "available" as a finished visit and redoes
+     * its online start (terms of service first), staying online; an error
+     * (tried 2026-10-18) made it log "NpCommerce2PollingResult() failed" and
+     * drop out of online to the mode select. */
+    if (mode == 1 && g_store_open && g_store_showing && g_store_open(title) == 0) {
+        /* the host's store page over the running game; finished when it closes */
+        np_log("PSN mode 1 (PS Store): the store page is open over the game");
+        g_store_up = 1;
+        g_psn_active = 0;
+        g_psn_status = PSN_PROCESSING;
+        return;
+    }
+    if (mode == 1) np_log("PSN mode 1 (PS Store): no store; answered as a sign-in");
     if (!g_be || !g_be->signin_begin) {
         np_log("no PSN backend: sign-in fails (real PSN authentication is not implemented)");
         g_psn_status = PSN_ERROR;
@@ -130,7 +150,14 @@ static void hle_PsnInitStart(void) {
 }
 
 static void hle_PsnGetStatus(void) {
-    if (g_psn_active && g_be && g_be->signin_state) {
+    if (g_store_up) {
+        if (g_store_showing()) g_psn_status = PSN_PROCESSING;
+        else {                                   /* closed: back to the game, still signed in */
+            g_store_up = 0;
+            g_psn_status = psp_np_signed_in() ? PSN_AVAILABLE : PSN_ERROR;
+            np_log("PSN mode 1 (PS Store): the store page was closed");
+        }
+    } else if (g_psn_active && g_be && g_be->signin_state) {
         switch (g_be->signin_state()) {
         case PSP_NP_SIGNIN_OK:        g_psn_status = PSN_AVAILABLE; g_psn_active = 0; break;
         case PSP_NP_SIGNIN_FAILED:
@@ -150,6 +177,7 @@ static void hle_PsnUpdate(void) { psp_ret(0); }
 static void hle_PsnShutdownStart(void) {
     if (g_psn_active && g_be && g_be->signin_cancel) g_be->signin_cancel();
     g_psn_active = 0;
+    g_store_up = 0;                     /* the host takes its page down when it polls it closed */
     psp_ret(0);
 }
 
