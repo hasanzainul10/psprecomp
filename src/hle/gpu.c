@@ -1156,6 +1156,8 @@ static void lerp_clip(const pvtx *a, const pvtx *b, float t, pvtx *o) {
 /* ---- hardware backend: collecting triangles ------------------------------------- */
 
 static const psp_gpu_backend *g_hw;
+static void (*g_observer)(const psp_gpu_draw_info *);
+void psp_gpu_set_draw_observer(void (*fn)(const psp_gpu_draw_info *)) { g_observer = fn; }
 void psp_gpu_set_backend(const psp_gpu_backend *be) { g_hw = be; }
 const psp_gpu_backend *psp_gpu_get_backend(void) { return g_hw; }
 
@@ -1423,6 +1425,20 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
         }
     }
 
+    if (g_observer) {
+        psp_gpu_draw_info di;
+        di.world = g_world; di.view = g_view; di.proj = g_proj;
+        di.bones = skin ? g_bone : NULL;
+        di.nbones = skin ? (int)VT_NWEIGHT(vt) : 0;
+        di.through = g_through;
+        di.prim = (int)type;
+        di.nverts = (int)n;
+        di.vaddr = vaddr;
+        di.vtype = vt;
+        di.fb_addr = R[0x9C] & 0x1FFFF0u;
+        di.tex_addr = (R[0x1E] & 1) ? tex_addr(0) : 0;
+        g_observer(&di);
+    }
     dump_draw(type, n, buf);
     if (g_hw && !g_ref) { hw_draw(type, buf, n); return; }
     /* PSP2I_GPU_VERIFY=N checks every Nth primitive (1 = all of them). */

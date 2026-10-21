@@ -135,4 +135,25 @@ void psp_gpu_decode_texture(uint32_t *out);
 /* For backends: a hash of the current texture's bytes (and CLUT). */
 uint64_t psp_gpu_texture_hash(void);
 
+/* A draw observer (the host's VR and reverse-engineering tools): called for
+ * every primitive batch the GE draws, after its vertices were transformed and
+ * before the backend draws them, with the matrices it was drawn with. The
+ * pointers are valid only during the call. Through-mode (2D) draws have
+ * through = 1 and no meaningful matrices. NULL (the default) = none. */
+typedef struct {
+    const float *world;     /* 4x3, column-major as the GE loads it (12 floats) */
+    const float *view;      /* 4x3 (12 floats) */
+    const float *proj;      /* 4x4 (16 floats) */
+    const float *bones;     /* nbones 4x3 bone matrices when skinned, else NULL */
+    int      nbones;        /* weights per vertex (bones used), 0 if not skinned */
+    int      through;       /* 2D: screen coordinates, no transform */
+    int      prim;          /* GE primitive type (0 points .. 6 sprites) */
+    int      nverts;
+    uint32_t vaddr;         /* the vertex data's guest address */
+    uint32_t vtype;         /* the vertex format (GE VTYPE) */
+    uint32_t fb_addr;       /* the colour target (VRAM offset, as psp_gpu_state) */
+    uint32_t tex_addr;      /* level-0 texture address, 0 when untextured */
+} psp_gpu_draw_info;
+void psp_gpu_set_draw_observer(void (*fn)(const psp_gpu_draw_info *));
+
 #endif
