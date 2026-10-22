@@ -61,6 +61,13 @@ static float    g_bone[8 * 12];
 static uint32_t g_world_i, g_view_i, g_proj_i, g_tgen_i, g_bone_i;
 static uint8_t  g_clut[1024];            /* the CLUT cache, filled by CLOAD */
 static uint64_t g_clut_hash;             /* FNV-1a of g_clut, updated by CLOAD */
+/* The CLUT as PPSSPP keeps it (clutBufRaw_, clutTotalBytes_, clutMaxBytes_),
+ * for texture-pack keys only (psp_gpu_pack_key): PPSSPP hashes the bytes of
+ * the last load plus the start offset, capped at the largest load so far, so
+ * a pack's CLUT hashes can only be matched with the same bookkeeping. */
+static uint8_t  g_clut_raw[2048];
+static uint32_t g_clut_load_bytes, g_clut_max_bytes;
+static uint32_t g_draw_maxv;             /* largest V of the current through-mode draw */
 static uint64_t g_pixels;
 /* Profiling counters (rasterizer workload). */
 static uint64_t c_tested, c_shaded, c_textured, c_linear, c_sprite_px, c_tri_px, c_blend, c_clear;
@@ -86,6 +93,8 @@ void psp_gpu_reset(void) {
     g_world_i = g_view_i = g_proj_i = g_tgen_i = g_bone_i = 0;
     memset(g_clut, 0, sizeof g_clut);
     g_clut_hash = 0;
+    memset(g_clut_raw, 0, sizeof g_clut_raw);
+    g_clut_load_bytes = g_clut_max_bytes = 0;
     /* Defaults where a zero register would be unusable rather than merely
      * unset: 8888 framebuffer, identity matrices, a full-screen scissor and
      * always-passing tests. Every game sets these explicitly. */
@@ -1711,6 +1720,124 @@ uint64_t psp_gpu_texture_hash(void) {
     return hsh;
 }
 
+/* ---- PPSSPP texture-pack keys ---------------------------------------------------------
+ *
+ * xxHash32/64 (Yann Collet's reference algorithm, BSD-2), the hashes PPSSPP's
+ * texture replacement uses: XXH32 for the CLUT, XXH64 for the texture bytes. */
+
+static uint32_t rotl32(uint32_t x, int r) { return (x << r) | (x >> (32 - r)); }
+static uint64_t rotl64(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
+static uint32_t ld32le(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint64_t ld64le(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+
+static uint32_t xxh32(const uint8_t *p, size_t len, uint32_t seed) {
+    const uint32_t P1 = 0x9E3779B1u, P2 = 0x85EBCA77u, P3 = 0xC2B2AE3Du, P4 = 0x27D4EB2Fu, P5 = 0x165667B1u;
+    const uint8_t *end = p + len;
+    uint32_t h;
+    if (len >= 16) {
+        uint32_t v1 = seed + P1 + P2, v2 = seed + P2, v3 = seed, v4 = seed - P1;
+        for (; p + 16 <= end; p += 16) {
+            v1 = rotl32(v1 + ld32le(p) * P2, 13) * P1;
+            v2 = rotl32(v2 + ld32le(p + 4) * P2, 13) * P1;
+            v3 = rotl32(v3 + ld32le(p + 8) * P2, 13) * P1;
+            v4 = rotl32(v4 + ld32le(p + 12) * P2, 13) * P1;
+        }
+        h = rotl32(v1, 1) + rotl32(v2, 7) + rotl32(v3, 12) + rotl32(v4, 18);
+    } else {
+        h = seed + P5;
+    }
+    h += (uint32_t)len;
+    for (; p + 4 <= end; p += 4) h = rotl32(h + ld32le(p) * P3, 17) * P4;
+    for (; p < end; p++) h = rotl32(h + *p * P5, 11) * P1;
+    h ^= h >> 15; h *= P2; h ^= h >> 13; h *= P3; h ^= h >> 16;
+    return h;
+}
+
+static uint64_t xxh64_round(uint64_t acc, uint64_t in) {
+    acc += in * 0xC2B2AE3D27D4EB4Full;
+    return rotl64(acc, 31) * 0x9E3779B185EBCA87ull;
+}
+
+static uint64_t xxh64(const uint8_t *p, size_t len, uint64_t seed) {
+    const uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full, P3 = 0x165667B19E3779F9ull,
+                   P4 = 0x85EBCA77C2B2AE63ull, P5 = 0x27D4EB2F165667C5ull;
+    const uint8_t *end = p + len;
+    uint64_t h;
+    if (len >= 32) {
+        uint64_t v[4] = { seed + P1 + P2, seed + P2, seed, seed - P1 };
+        for (; p + 32 <= end; p += 32)
+            for (int k = 0; k < 4; k++) v[k] = xxh64_round(v[k], ld64le(p + k * 8));
+        h = rotl64(v[0], 1) + rotl64(v[1], 7) + rotl64(v[2], 12) + rotl64(v[3], 18);
+        for (int k = 0; k < 4; k++) h = (h ^ xxh64_round(0, v[k])) * P1 + P4;
+    } else {
+        h = seed + P5;
+    }
+    h += (uint64_t)len;
+    for (; p + 8 <= end; p += 8) h = rotl64(h ^ xxh64_round(0, ld64le(p)), 27) * P1 + P4;
+    if (p + 4 <= end) { h = rotl64(h ^ (uint64_t)ld32le(p) * P1, 23) * P2 + P3; p += 4; }
+    for (; p < end; p++) h = rotl64(h ^ *p * P5, 11) * P1;
+    h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P3; h ^= h >> 32;
+    return h;
+}
+
+/* TextureReplacer::ComputeHash (hash = xxh64): the texture's bytes as one
+ * block when rows are contiguous, else row by row (only the w texels of
+ * each). Swizzling is ignored, as there. 0 when the bytes are outside
+ * memory. */
+static uint32_t pack_data_hash(uint32_t addr, uint32_t bufw, uint32_t w, uint32_t h, uint32_t bpp) {
+    const uint64_t seed = 0xBACD7814u;
+    if (bufw <= w) {
+        const uint32_t bytes = bpp * (bufw * h + (w - bufw)) / 8;
+        const uint8_t *p = mem(addr, bytes);
+        return p ? (uint32_t)xxh64(p, bytes, seed) : 0;
+    }
+    const uint32_t line = bpp * w / 8, stride = bpp * bufw / 8;
+    const uint8_t *p = mem(addr, (h - 1) * stride + line);
+    if (!p) return 0;
+    uint32_t r = 0;
+    for (uint32_t y = 0; y < h; y++, p += stride) r = r * 11 ^ (uint32_t)xxh64(p, line, seed);
+    return r;
+}
+
+int psp_gpu_pack_key(uint32_t *addr, uint32_t *clut_key, uint32_t hashes[2]) {
+    static const uint32_t bpp_of[11] = { 16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8 };
+    int psm = (int)(R[0xC3] & 0xF);
+    if (psm >= 11) psm = 0;                        /* invalid formats: PPSSPP treats them as 5650 */
+    const uint32_t bpp = bpp_of[psm];
+    const uint32_t a = tex_addr(0);
+    const uint32_t w = tex_w(0), h = tex_h(0);
+    /* GetTextureBufw: aligned to 16 bytes (DXT unaligned); 0 means 16 bytes. */
+    uint32_t bufw = R[0xA8] & (psm >= 8 ? 0x7FFu : 0x7FFu & ~(128u / bpp - 1));
+    if (!bufw) bufw = 128u / bpp;
+
+    /* TexCacheEntry::CacheKey, low half: the TSIZE0 register, XOR the CLUT
+     * hash for the CLUT formats -- XXH32 of the CLUT bytes XOR the whole
+     * CMODE command word (opcode 0xC5 included, as PPSSPP's gstate holds it). */
+    uint32_t ck = R[0xB8] & 0xF0F;
+    if (psm & 4) {
+        const uint32_t cmode = R[0xC5] & 0xFFFFFF;
+        const uint32_t start = ((cmode >> 16) & 0x1F) << 4;
+        uint32_t ext = g_clut_load_bytes + start * ((cmode & 3) == 3 ? 4u : 2u);
+        if (ext > g_clut_max_bytes) ext = g_clut_max_bytes;
+        ck ^= xxh32(g_clut_raw, ext, 0xC0108888u) ^ (0xC5000000u | cmode);
+    }
+    *addr = a & 0x3FFFFFFF;
+    *clut_key = ck;
+
+    /* A 512-tall texture drawn in through mode is hashed only down to the
+     * rows the first draw reached (maxSeenV, at least 272); once a draw
+     * reaches further PPSSPP rehashes all 512. Which one a pack recorded
+     * depends on the draws before, so offer both. Swizzled CLUT4 atlases
+     * always hash all 512. */
+    int n = 0;
+    if (h == 512 && g_through && g_draw_maxv > 0 && !((R[0xC2] & 1) && psm == 4)) {
+        const uint32_t seen = g_draw_maxv < 272 ? 272 : g_draw_maxv;
+        if (seen < 512) hashes[n++] = pack_data_hash(a, bufw, w, seen, bpp);
+    }
+    hashes[n++] = pack_data_hash(a, bufw, w, h, bpp);
+    return n;
+}
+
 /* Bytes of the colour buffer the scissor can reach (for coherence hooks). */
 static uint32_t fb_span(void) { return ((uint32_t)g_sy1 + 1) * g_fbw * (g_psm == 3 ? 4u : 2u); }
 static uint32_t zb_span(void) { return ((uint32_t)g_sy1 + 1) * g_zbw * 2u; }
@@ -1765,6 +1892,12 @@ static void collect_points_lines(uint32_t type, const pvtx *buf, uint32_t n) {
  * refuses are rasterized in software against a VRAM the backend has
  * synchronised first and is told about afterwards. */
 static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n) {
+    /* PPSSPP's vertBounds.maxV, which decides how much of a 512-tall
+     * texture its pack hash covers (psp_gpu_pack_key). */
+    g_draw_maxv = 0;
+    if (g_through && g_tex && tex_h(0) == 512)
+        for (uint32_t i = 0; i < n; i++)
+            if (buf[i].s.v > (float)g_draw_maxv) g_draw_maxv = (uint32_t)buf[i].s.v;
     if (type <= 2) {
         g_hwn = 0;
         collect_points_lines(type, buf, n);
@@ -1869,6 +2002,16 @@ void psp_gpu_cmd(uint32_t cmd, uint32_t arg) {
         uint64_t h = 0xCBF29CE484222325ull;
         for (size_t i = 0; i < sizeof g_clut; i++) h = (h ^ g_clut[i]) * 1099511628211ull;
         g_clut_hash = h;
+        /* PPSSPP's copy (LoadClut): 0x40 blocks is allowed as 2 KB, a load
+         * from an invalid address reads as zeroes, and an empty load keeps
+         * the previous size. */
+        const uint32_t rn = (arg & 0x7F) == 0x40 ? 2048u : n;
+        if (rn) {
+            const uint8_t *q = mem(src, rn);
+            if (q) memcpy(g_clut_raw, q, rn); else memset(g_clut_raw, 0, rn);
+            g_clut_load_bytes = rn;
+            if (rn > g_clut_max_bytes) g_clut_max_bytes = rn;
+        }
         break;
     }
     case 0xEA: block_transfer(arg); break;
