@@ -2160,6 +2160,8 @@ static int st_fullscreen(const pvtx *buf, uint32_t n) {
     return w * h >= 0.45f * 480.0f * 272.0f || (w >= 0.9f * 480.0f && h >= 0.85f * 272.0f);
 }
 
+static void st_bbox(const pvtx *b, uint32_t n, float *r);
+
 static int stereo_classify(const pvtx *buf, uint32_t n) {
     const float *p = g_proj;
     const uint64_t flip = psp_display_flips();
@@ -2193,7 +2195,13 @@ static int stereo_classify(const pvtx *buf, uint32_t n) {
     if (persp && !g_st_flat) return ST_MOVE;
     if (!g_st_latched || !g_st_3d_fb || g_fb != g_st_3d_fb || g_clear || !n || n > 65536) return ST_SAME;
     if (g_st_flat) {                                   /* the HUD pass on the 3D target */
-        const int panel_layer = !persp || (g_stereo.hud_panel && g_stereo.hud_panel(buf[0].clip[3]));
+        float frac = 0;
+        if (persp && g_stereo.hud_panel) {
+            float r[4];
+            st_bbox(buf, n, r);
+            if (r[2] > r[0] && r[3] > r[1]) frac = (r[2] - r[0]) * (r[3] - r[1]) / (480.0f * 272.0f);
+        }
+        const int panel_layer = !persp || (g_stereo.hud_panel && g_stereo.hud_panel(buf[0].clip[3], frac));
         if (!panel_layer) return ST_HUD;
         return g_hw && g_hw->draw_hud ? ST_PANEL : ST_SAME;
     }

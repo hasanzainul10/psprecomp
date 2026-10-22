@@ -149,8 +149,8 @@ typedef struct {
  * takes fov_scale): the eyes see that many times the game's view across and
  * up (the tangents of its FOV).
  * With eye_views, the HUD pass (after the second clear of the 3D target,
- * flat_after_clear) is split: its 2D draws and the perspective ones whose
- * clip w the host's hud_panel accepts (a game's HUD and menu layers) go, as
+ * flat_after_clear) is split: its 2D draws and the perspective ones that the
+ * host's hud_panel accepts (by clip w and the share of the screen they cover) (a game's HUD and menu layers) go, as
  * the game drew them, to the backend's draw_hud for the host's HUD panel; the
  * other perspective ones (world labels already projected for the game
  * camera) are seen from the eyes along their own direction. Small
@@ -166,7 +166,7 @@ typedef struct psp_gpu_stereo {
     int   eye_views;
     float eye_view[2][16];
     float fov_scale, fov_scale_y;
-    int   (*hud_panel)(float clip_w);
+    int   (*hud_panel)(float clip_w, float screen_frac);   /* screen_frac: the draw's box / the screen */
     float fx_dist;
     /* Set by on_frame: this frame is drawn as the game drew it, the same in
      * both eyes (a menu scene the host shows on a flat screen). */
