@@ -134,5 +134,14 @@ void psp_gpu_dump_next_frame(const char *path);
 void psp_gpu_decode_texture(uint32_t *out);
 /* For backends: a hash of the current texture's bytes (and CLUT). */
 uint64_t psp_gpu_texture_hash(void);
+/* For backends that load PPSSPP texture packs (textures.ini, hash = xxh64):
+ * the current texture's key as PPSSPP computes it, so a pack's [hashes]
+ * lines "AAAAAAAACCCCCCCCDDDDDDDD" match bit for bit. *addr is the address
+ * (A, zero in packs with ignoreAddress), *clut_key is C (the texture size
+ * register, XOR the CLUT hash for CLUT formats), and hashes[] gets D, the
+ * hash of the texture bytes: usually one, two for a 512-tall texture in
+ * through mode (PPSSPP's maxSeenV), most likely first. Returns how many.
+ * Call it from the backend's draw, where the draw state is current. */
+int psp_gpu_pack_key(uint32_t *addr, uint32_t *clut_key, uint32_t hashes[2]);
 
 #endif
