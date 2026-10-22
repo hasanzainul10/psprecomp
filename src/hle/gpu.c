@@ -1827,10 +1827,13 @@ int psp_gpu_pack_key(uint32_t *addr, uint32_t *clut_key, uint32_t hashes[2]) {
     /* A 512-tall texture drawn in through mode is hashed only down to the
      * rows the first draw reached (maxSeenV, at least 272); once a draw
      * reaches further PPSSPP rehashes all 512. Which one a pack recorded
-     * depends on the draws before, so offer both. Swizzled CLUT4 atlases
-     * always hash all 512. */
+     * depends on the draws before, so offer both. PPSSPP master hashes
+     * swizzled CLUT4 atlases at all 512 always (#21980), but packs made
+     * with earlier versions (1.17 and before, e.g. PSP2i's) keyed them at
+     * maxSeenV -- the title background and the NPC portraits -- so those
+     * get both keys too. */
     int n = 0;
-    if (h == 512 && g_through && g_draw_maxv > 0 && !((R[0xC2] & 1) && psm == 4)) {
+    if (h == 512 && g_through && g_draw_maxv > 0) {
         const uint32_t seen = g_draw_maxv < 272 ? 272 : g_draw_maxv;
         if (seen < 512) hashes[n++] = pack_data_hash(a, bufw, w, seen, bpp);
     }
