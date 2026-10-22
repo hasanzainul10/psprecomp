@@ -189,6 +189,16 @@ uint32_t psp_gpu_stereo_tag(void);
  * once psp_gpu_stereo_tracing() is 0. */
 void psp_gpu_stereo_trace(void *out);
 int  psp_gpu_stereo_tracing(void);
+/* A dev measure of one frame (from the next flip to the one after): the
+ * moved 3D scene draws' vertices in the game camera's view space within
+ * `radius` of the vertical line through `at` (the line along `up`, a unit
+ * vector in view space) and at most `height_max` above `at` (not ceilings).
+ * psp_gpu_stereo_probe_result: 1 once done, with
+ * out[0] / out[1] the lowest / highest such vertex as a height along up
+ * above `at`, and out[2] how many there were. For a host that needs a model's
+ * height (VR first person: the player's head above its position). */
+void psp_gpu_stereo_probe(const float at[3], const float up[3], float radius, float height_max);
+int  psp_gpu_stereo_probe_result(float out[3]);
 
 void psp_gpu_set_backend(const psp_gpu_backend *be);   /* NULL = software */
 const psp_gpu_backend *psp_gpu_get_backend(void);

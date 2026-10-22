@@ -1375,6 +1375,8 @@ static int  stereo_classify(const pvtx *buf, uint32_t n);
 static void hw_draw_hud(uint32_t type, const pvtx *buf, uint32_t n);
 static void st_trace_flip(void);
 static void st_trace_draw(uint32_t type, const pvtx *buf, uint32_t n, int shift);
+static void st_probe_draw(const pvtx *buf, uint32_t n);
+static int  g_st_probe_on;                 /* psp_gpu_stereo_probe: 1 armed, 2 measuring */
 static void hud_scissor_restore(void);
 static FILE *g_st_trace;                 /* psp_gpu_stereo_trace (below) */
 static int   g_st_trace_on;
@@ -1466,6 +1468,7 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
         if (st) st_trace_flip();
         const int shift = st ? stereo_classify(buf, n) : 0;
         if (st && g_st_trace && g_st_trace_on) st_trace_draw(type, buf, n, shift);
+        if (st && g_st_probe_on && shift == 1) st_probe_draw(buf, n);  /* ST_MOVE: the 3D scene */
         if (st && shift == 3) { hw_draw_hud(type, buf, n); return; }   /* ST_PANEL: the HUD picture only */
         hw_draw(type, st ? stereo_mono(buf, n, shift) : buf, n);
         hud_scissor_restore();
@@ -2291,6 +2294,56 @@ static void st_bbox(const pvtx *b, uint32_t n, float *r) {
         if (b[i].s.y < r[1]) r[1] = b[i].s.y;
         if (b[i].s.x > r[2]) r[2] = b[i].s.x;
         if (b[i].s.y > r[3]) r[3] = b[i].s.y;
+    }
+}
+
+/* psp_gpu_stereo_probe: armed, it measures from the next flip to the one
+ * after (the frame's moved draws), in the game camera's view space (clip x,
+ * y, w through g_st_unproj, as the HUD pass's labels). */
+static float    g_st_probe_at[3], g_st_probe_up[3], g_st_probe_r, g_st_probe_hmax, g_st_probe_res[3];
+static uint64_t g_st_probe_flip;
+static int      g_st_probe_done;
+
+void psp_gpu_stereo_probe(const float at[3], const float up[3], float radius, float height_max) {
+    memcpy(g_st_probe_at, at, sizeof g_st_probe_at);
+    memcpy(g_st_probe_up, up, sizeof g_st_probe_up);
+    g_st_probe_r = radius;
+    g_st_probe_hmax = height_max;
+    g_st_probe_res[0] = 1e9f; g_st_probe_res[1] = -1e9f; g_st_probe_res[2] = 0;
+    g_st_probe_done = 0;
+    g_st_probe_flip = 0;
+    g_st_probe_on = 1;
+}
+
+int psp_gpu_stereo_probe_result(float out[3]) {
+    if (!g_st_probe_done) return 0;
+    memcpy(out, g_st_probe_res, sizeof g_st_probe_res);
+    return 1;
+}
+
+static void st_probe_draw(const pvtx *buf, uint32_t n) {
+    const uint64_t flip = psp_display_flips();
+    if (g_st_probe_on == 1) {                                   /* from the next flip */
+        if (!g_st_probe_flip) g_st_probe_flip = flip + 1;
+        if (flip < g_st_probe_flip) return;
+        g_st_probe_on = 2;
+        g_st_probe_flip = flip;
+    }
+    if (flip != g_st_probe_flip) { g_st_probe_on = 0; g_st_probe_done = 1; return; }
+    if (!stereo_kmat() || !g_st_unproj_ok) return;
+    const float *u = g_st_unproj, *a = g_st_probe_at, *up = g_st_probe_up;
+    for (uint32_t i = 0; i < n; i++) {
+        const float x = buf[i].clip[0], y = buf[i].clip[1], w = buf[i].clip[3];
+        if (w <= W_EPS) continue;
+        const float v[3] = { u[0] * x + u[3] * y + u[6] * w - a[0], u[1] * x + u[4] * y + u[7] * w - a[1],
+                             u[2] * x + u[5] * y + u[8] * w - a[2] };
+        const float h = v[0] * up[0] + v[1] * up[1] + v[2] * up[2];
+        if (h > g_st_probe_hmax) continue;
+        const float s[3] = { v[0] - h * up[0], v[1] - h * up[1], v[2] - h * up[2] };   /* off the vertical line */
+        if (s[0] * s[0] + s[1] * s[1] + s[2] * s[2] > g_st_probe_r * g_st_probe_r) continue;
+        if (h < g_st_probe_res[0]) g_st_probe_res[0] = h;
+        if (h > g_st_probe_res[1]) g_st_probe_res[1] = h;
+        g_st_probe_res[2] += 1.0f;
     }
 }
 
