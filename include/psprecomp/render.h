@@ -167,7 +167,7 @@ typedef struct psp_gpu_stereo {
     float eye_view[2][16];
     float fov_scale, fov_scale_y;
     int   (*hud_panel)(float clip_w, float screen_frac);   /* screen_frac: the draw's box / the screen */
-    float fx_dist;
+    float fx_dist;        /* on_frame may set it per frame (the host's first person) */
     /* Set by on_frame: this frame is drawn as the game drew it, the same in
      * both eyes (a menu scene the host shows on a flat screen). */
     int   flat_frame;

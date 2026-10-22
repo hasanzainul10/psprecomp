@@ -2187,6 +2187,8 @@ static int stereo_classify(const pvtx *buf, uint32_t n) {
         memcpy(s.proj, g_proj, sizeof s.proj);
         if (s.on_frame) s.on_frame(&s);
         memcpy(g_st_view, s.eye_view, sizeof g_st_view);
+        g_stereo.near_w = s.near_w;                     /* on_frame may set these per frame too */
+        g_stereo.fx_dist = s.fx_dist;
         g_st_tag = s.flat_frame ? 0 : s.tag;
         g_st_flat_frame = s.flat_frame;
         g_st_latched = 1;
