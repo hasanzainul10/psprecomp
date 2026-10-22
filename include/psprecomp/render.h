@@ -119,6 +119,11 @@ typedef struct {
      * again for one eye (0 left, 1 right), with the same state and that eye's
      * vertices. Only after draw() accepted it. NULL = no stereo. */
     int  (*draw_eye)(int eye, const psp_gpu_state *st, const psp_gpu_vertex *v, int nverts);
+    /* Optional (stereo with eye_views): a HUD draw (see psp_gpu_stereo), as
+     * the game made it, into the backend's own HUD picture instead of the
+     * target (which never gets it). 0 if drawn. NULL = the HUD stays in the
+     * eyes. */
+    int  (*draw_hud)(const psp_gpu_state *st, const psp_gpu_vertex *v, int nverts);
 } psp_gpu_backend;
 
 /* Stereo for the host's VR: after each draw the backend accepted, the GE
@@ -142,11 +147,16 @@ typedef struct {
  * host's name for that pose (psp_gpu_stereo_tag).
  * fov_scale, fov_scale_y (with eye_views; <= 1: off, and fov_scale_y <= 1
  * takes fov_scale): the eyes see that many times the game's view across and
- * up (the tangents of its FOV). With eye_views the HUD pass (after the
- * second clear of the 3D target, flat_after_clear) is seen from the eyes too,
- * keeping its depth values, so it keeps the game's size and its labels stay
- * on what they label; its non-perspective draws are shrunk to the game's
- * view instead. */
+ * up (the tangents of its FOV).
+ * With eye_views, the HUD pass (after the second clear of the 3D target,
+ * flat_after_clear) is split: its 2D draws and the perspective ones whose
+ * clip w the host's hud_panel accepts (a game's HUD and menu layers) go, as
+ * the game drew them, to the backend's draw_hud for the host's HUD panel; the
+ * other perspective ones (world labels already projected for the game
+ * camera) are seen from the eyes along their own direction. Small
+ * orthographic draws in the scene pass on the 3D target (screen-space
+ * effects) are placed in the world fx_dist away (game units; <= 0: 50)
+ * through the scene's projection. */
 typedef struct psp_gpu_stereo {
     int   on;
     float half_ipd;
@@ -156,6 +166,12 @@ typedef struct psp_gpu_stereo {
     int   eye_views;
     float eye_view[2][16];
     float fov_scale, fov_scale_y;
+    int   (*hud_panel)(float clip_w);
+    float fx_dist;
+    /* Set by on_frame: this frame is drawn as the game drew it, the same in
+     * both eyes (a menu scene the host shows on a flat screen). */
+    int   flat_frame;
+    float proj[16];       /* on_frame: the PROJ of the frame's first moved draw (filled by the GE) */
     uint32_t tag;
     void (*on_frame)(struct psp_gpu_stereo *s);
 } psp_gpu_stereo;
@@ -166,6 +182,13 @@ float psp_gpu_stereo_tan_half_fov(void);
 /* eye_views: the tag of the frame being drawn, 0 while it has had no moved
  * draw yet (or eye_views is off). Backends keep it with their eye pictures. */
 uint32_t psp_gpu_stereo_tag(void);
+/* A dev trace of one frame's stereo decisions into `out` (a FILE *): the
+ * eye matrices, and each draw that isn't a moved 3D scene draw with what
+ * the eyes do with it (screen box and scissor before and after, left eye).
+ * Starts at the next flip, stops at the one after; the caller closes `out`
+ * once psp_gpu_stereo_tracing() is 0. */
+void psp_gpu_stereo_trace(void *out);
+int  psp_gpu_stereo_tracing(void);
 
 void psp_gpu_set_backend(const psp_gpu_backend *be);   /* NULL = software */
 const psp_gpu_backend *psp_gpu_get_backend(void);

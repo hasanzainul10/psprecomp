@@ -1371,7 +1371,14 @@ static int g_verify = -1;
 static void rasterize(uint32_t type, const pvtx *buf, uint32_t n);
 static void verify_rasterize(uint32_t type, const pvtx *buf, uint32_t n);
 static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n);
-static int  stereo_classify(uint32_t n);
+static int  stereo_classify(const pvtx *buf, uint32_t n);
+static void hw_draw_hud(uint32_t type, const pvtx *buf, uint32_t n);
+static void st_trace_flip(void);
+static void st_trace_draw(uint32_t type, const pvtx *buf, uint32_t n, int shift);
+static void hud_scissor_restore(void);
+static FILE *g_st_trace;                 /* psp_gpu_stereo_trace (below) */
+static int   g_st_trace_on;
+static pvtx  g_lbuf[65536];
 static const pvtx *stereo_mono(const pvtx *buf, uint32_t n, int shift);
 static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n, int shift);
 static psp_gpu_stereo g_stereo;
@@ -1456,8 +1463,12 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
     dump_draw(type, n, buf);
     if (g_hw && !g_ref) {
         const int st = g_stereo.on && g_hw->draw_eye != NULL;
-        const int shift = st ? stereo_classify(n) : 0;
+        if (st) st_trace_flip();
+        const int shift = st ? stereo_classify(buf, n) : 0;
+        if (st && g_st_trace && g_st_trace_on) st_trace_draw(type, buf, n, shift);
+        if (st && shift == 3) { hw_draw_hud(type, buf, n); return; }   /* ST_PANEL: the HUD picture only */
         hw_draw(type, st ? stereo_mono(buf, n, shift) : buf, n);
+        hud_scissor_restore();
         if (st && g_hw_ok) hw_draw_eyes(type, buf, n, shift);
         return;
     }
@@ -1971,8 +1982,53 @@ static int      g_st_flat;
 static int      g_st_latched;
 static float    g_st_view[2][16];
 static uint32_t g_st_tag;
+static int      g_st_flat_frame;              /* on_frame's flat_frame: this frame as the game drew it */
 static float    g_st_k[2][16], g_st_kproj[16];
+static float    g_st_ke[2][16];                   /* the HUD pass's labels: S * PROJ * eye_view */
+static float    g_st_unproj[9];                   /* clip x, y, w -> view x, y, z (PROJ's rows 0, 1, 3) */
+static int      g_st_k_ok, g_st_unproj_ok;        /* g_st_k (needs PROJ^-1), g_st_unproj usable */
 static int      g_st_kvalid;
+static float    g_st_sproj[16], g_st_sunproj[9], g_st_kfx[2][16];   /* the scene's PROJ (ST_FX), latched */
+static int      g_st_sproj_ok;
+static uint64_t g_st_hud_draws, g_st_panel_draws, g_st_fx_draws;
+
+/* psp_gpu_stereo_trace: one frame's stereo decisions, for the host's VR
+ * captures. Armed now, it starts at the next flip and stops at the one
+ * after. */
+static FILE    *g_st_trace;
+static int      g_st_trace_on;                  /* 0 armed, 1 tracing */
+static uint64_t g_st_trace_flip;
+static uint32_t g_st_trace_n, g_st_trace_moved;
+
+void psp_gpu_stereo_trace(void *out) {
+    g_st_trace = (FILE *)out; g_st_trace_on = 0; g_st_trace_flip = 0; g_st_trace_n = g_st_trace_moved = 0;
+}
+int  psp_gpu_stereo_tracing(void) { return g_st_trace != NULL; }
+
+static void st_trace_mat(const char *name, const float *m) {
+    fprintf(g_st_trace, "  %-14s %8.4f %8.4f %8.4f %8.4f | %8.4f %8.4f %8.4f %8.4f | %8.4f %8.4f %8.4f %8.4f | %8.3f %8.3f %8.3f %8.4f\n",
+            name, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+}
+
+/* At each draw (stereo_classify's caller): start and stop at flips. */
+static void st_trace_flip(void) {
+    if (!g_st_trace) return;
+    const uint64_t flip = psp_display_flips();
+    if (!g_st_trace_on) {
+        if (g_st_trace_flip == 0) { g_st_trace_flip = flip + 1; return; }   /* wait for the next flip */
+        if (flip < g_st_trace_flip) return;
+        g_st_trace_on = 1;
+        g_st_trace_flip = flip;
+        fprintf(g_st_trace, "frame: flip %llu\n", (unsigned long long)flip);
+        return;
+    }
+    if (flip != g_st_trace_flip) {
+        fprintf(g_st_trace, "end of frame: %u draws, %u of them moved 3D scene draws (not listed)\n",
+                g_st_trace_n, g_st_trace_moved);
+        fflush(g_st_trace);
+        g_st_trace = NULL;
+    }
+}
 
 uint32_t psp_gpu_stereo_tag(void) {
     return g_stereo.on && g_stereo.eye_views && g_st_latched && g_st_flip == psp_display_flips() ? g_st_tag : 0;
@@ -1985,47 +2041,6 @@ static float stereo_fov_x(void) {
 }
 static float stereo_fov_y(void) {
     return g_stereo.eye_views && g_stereo.fov_scale_y > 1.0f ? g_stereo.fov_scale_y : stereo_fov_x();
-}
-
-/* Per draw, before the mono draw: what the eyes do with it.
- *   ST_SAME   the same in both eyes (through-mode, orthographic: screen depth)
- *   ST_MOVE   moved per eye (the 3D scene)
- *   ST_HUD    eye_views: the HUD pass (after the second clear of the 3D
- *             target) moved per eye too, keeping each vertex's depth value.
- *             PSP2i draws the HUD and its world labels (names, the lock-on
- *             reticle) there as flat perspective sheets already projected
- *             for the game camera; seen from the head they keep their
- *             direction, so labels stay on what they label and the HUD stays
- *             in front of the game camera (the body), not the eyes.
- *   ST_SHRINK eye_views, wider view: other HUD-pass draws on the 3D target,
- *             shrunk so they keep the game's size and place. Draws to other
- *             targets (the final copy to the display buffer) stay as they are.
- * Also keeps the frame's HUD-pass state (flat_after_clear) and, with
- * eye_views, latches the frame's eye matrices at its first moved draw. */
-enum { ST_SAME, ST_MOVE, ST_HUD, ST_SHRINK };
-static int stereo_classify(uint32_t n) {
-    const float *p = g_proj;
-    const uint64_t flip = psp_display_flips();
-    if (flip != g_st_flip) { g_st_flip = flip; g_st_3d_fb = 0; g_st_flat = 0; g_st_latched = 0; }
-    if (g_clear && g_st_3d_fb && g_fb == g_st_3d_fb && g_stereo.flat_after_clear) g_st_flat = 1;
-    /* Perspective: w grows with distance. Orthographic draws (bloom and blur
-     * passes) and the HUD pass stay at screen depth, like through-mode ones. */
-    const int persp = !g_through && fabsf(p[11]) > 1e-6f && (g_stereo.converge > 0 || g_stereo.eye_views) && n <= 65536;
-    const int hud = g_st_flat && !g_through && g_fb == g_st_3d_fb && g_stereo.eye_views && n <= 65536;
-    if (persp && !g_st_flat) g_st_3d_fb = g_fb;
-    if (persp && !g_st_flat && p[0] != 0) g_stereo_tan = 1.0f / fabsf(p[0]);
-    if (persp && !g_st_flat && g_stereo.eye_views && !g_st_latched) {
-        psp_gpu_stereo s = g_stereo;
-        if (s.on_frame) s.on_frame(&s);
-        memcpy(g_st_view, s.eye_view, sizeof g_st_view);
-        g_st_tag = s.tag;
-        g_st_latched = 1;
-        g_st_kvalid = 0;
-    }
-    if (persp && !g_st_flat) return ST_MOVE;
-    if (hud && persp && g_st_latched) return ST_HUD;
-    if (hud && (stereo_fov_x() > 1.0f || stereo_fov_y() > 1.0f)) return ST_SHRINK;
-    return ST_SAME;
 }
 
 /* Column-major 4x4: out = a * b. */
@@ -2063,40 +2078,266 @@ static int mat4_inv(const float *m, float *out) {
     return 1;
 }
 
-/* eye_views: each eye's clip-space matrix S * PROJ * eye_view * PROJ^-1
- * (the vertices are already in the game's clip space; S widens the view by
- * fov_scale), redone when PROJ changes. */
+/* Clip x, y, w -> view x, y, z: the inverse of PROJ's rows 0, 1 and 3. The
+ * HUD pass's projections have a degenerate depth row (clip z is a constant,
+ * PROJ[10] ~ 0), so the full 4x4 inverse is near-singular and turns its
+ * sheets into garbage; this 3x3 is well conditioned for any perspective
+ * projection, off-centre ones too. 0 if it has no inverse. */
+static int unproj3(const float *P, float *u) {
+    const float a = P[0], b = P[4], c = P[8], d = P[1], e = P[5], f = P[9], g = P[3], h = P[7], i = P[11];
+    const float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if (fabsf(det) < 1e-12f) return 0;
+    u[0] = (e * i - f * h) / det; u[1] = (c * h - b * i) / det; u[2] = (b * f - c * e) / det;
+    u[3] = (f * g - d * i) / det; u[4] = (a * i - c * g) / det; u[5] = (c * d - a * f) / det;
+    u[6] = (d * h - e * g) / det; u[7] = (b * g - a * h) / det; u[8] = (a * e - b * d) / det;
+    return 1;
+}
+
+/* m (column-major 4x4) times S, the wider view (clip x and y scaled). */
+static void widen(float *m) {
+    const float wx = 1.0f / stereo_fov_x(), wy = 1.0f / stereo_fov_y();
+    for (int c = 0; c < 4; c++) { m[c * 4] *= wx; m[c * 4 + 1] *= wy; }
+}
+
+/* The frame's eye matrices for the current PROJ, redone when PROJ changes:
+ * g_st_k = S * PROJ * eye_view * PROJ^-1 (the scene: its vertices are in the
+ * game's clip space), g_st_ke = S * PROJ * eye_view and g_st_unproj (the HUD
+ * pass's labels, unprojected along their own direction). */
 static int stereo_kmat(void) {
     if (g_st_kvalid && !memcmp(g_st_kproj, g_proj, sizeof g_st_kproj)) return 1;
     float inv[16], t[16];
-    if (!mat4_inv(g_proj, inv)) return 0;
-    const float wx = 1.0f / stereo_fov_x(), wy = 1.0f / stereo_fov_y();
+    g_st_k_ok = mat4_inv(g_proj, inv);
+    g_st_unproj_ok = unproj3(g_proj, g_st_unproj);
     for (int e = 0; e < 2; e++) {
-        mat4_mul(g_st_view[e], inv, t);
-        mat4_mul(g_proj, t, g_st_k[e]);
-        for (int c = 0; c < 4; c++) { g_st_k[e][c * 4] *= wx; g_st_k[e][c * 4 + 1] *= wy; }
+        if (g_st_k_ok) { mat4_mul(g_st_view[e], inv, t); mat4_mul(g_proj, t, g_st_k[e]); widen(g_st_k[e]); }
+        mat4_mul(g_proj, g_st_view[e], g_st_ke[e]);
+        widen(g_st_ke[e]);
     }
     memcpy(g_st_kproj, g_proj, sizeof g_st_kproj);
     g_st_kvalid = 1;
     return 1;
 }
 
+/* At the latch: the scene's projection, for ST_FX (screen-space effects are
+ * placed through it): S * PROJ * eye_view per eye, and its unprojection. */
+static void stereo_fx_latch(void) {
+    memcpy(g_st_sproj, g_proj, sizeof g_st_sproj);
+    g_st_sproj_ok = unproj3(g_proj, g_st_sunproj);
+    for (int e = 0; e < 2; e++) { mat4_mul(g_proj, g_st_view[e], g_st_kfx[e]); widen(g_st_kfx[e]); }
+}
+
+/* Per draw, before the mono draw: what the eyes do with it.
+ *   ST_SAME   the same in both eyes, as the game drew it (through-mode,
+ *             orthographic full-screen passes such as bloom, other targets)
+ *   ST_MOVE   the 3D scene, seen from each eye (eye_views) or IPD-shifted
+ *   ST_HUD    eye_views: a HUD-pass draw (after the second clear of the 3D
+ *             target) that stays in the world: PSP2i draws its world labels
+ *             (names, the lock-on reticle) as flat perspective sheets
+ *             already projected for the game camera; seen from each eye along
+ *             their own direction they stay on what they label
+ *   ST_PANEL  eye_views with a backend draw_hud: the rest of the HUD pass on
+ *             the 3D target (the host's hud_panel layers, and 2D draws) goes
+ *             to the backend's HUD picture as the game drew it, for the
+ *             host's HUD panel; neither the eyes nor VRAM get it
+ *   ST_FX     eye_views: a small orthographic draw in the scene pass on the
+ *             3D target (PSP2i's hit sparks and technique effects, w = 1),
+ *             placed in the world through the scene's projection
+ * Also keeps the frame's HUD-pass state (flat_after_clear) and, with
+ * eye_views, latches the frame's eye matrices at its first moved draw. */
+enum { ST_SAME, ST_MOVE, ST_HUD, ST_PANEL, ST_FX };
+
+/* Near full-screen (bloom and copy passes): at least 45% of the screen, or
+ * nearly its whole width and height. */
+static int st_fullscreen(const pvtx *buf, uint32_t n) {
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (uint32_t i = 0; i < n; i++) {
+        if (buf[i].s.x < x0) x0 = buf[i].s.x;
+        if (buf[i].s.x > x1) x1 = buf[i].s.x;
+        if (buf[i].s.y < y0) y0 = buf[i].s.y;
+        if (buf[i].s.y > y1) y1 = buf[i].s.y;
+    }
+    const float w = x1 - x0, h = y1 - y0;
+    return w * h >= 0.45f * 480.0f * 272.0f || (w >= 0.9f * 480.0f && h >= 0.85f * 272.0f);
+}
+
+static int stereo_classify(const pvtx *buf, uint32_t n) {
+    const float *p = g_proj;
+    const uint64_t flip = psp_display_flips();
+    if (flip != g_st_flip) { g_st_flip = flip; g_st_3d_fb = 0; g_st_flat = 0; g_st_latched = 0; }
+    if (g_clear && g_st_3d_fb && g_fb == g_st_3d_fb && g_stereo.flat_after_clear) g_st_flat = 1;
+    /* Perspective: w grows with distance. */
+    const int persp = !g_through && fabsf(p[11]) > 1e-6f && (g_stereo.converge > 0 || g_stereo.eye_views) && n <= 65536;
+    if (persp && !g_st_flat) g_st_3d_fb = g_fb;
+    if (persp && !g_st_flat && p[0] != 0) g_stereo_tan = 1.0f / fabsf(p[0]);
+    if (persp && !g_st_flat && g_stereo.eye_views && !g_st_latched) {
+        psp_gpu_stereo s = g_stereo;
+        memcpy(s.proj, g_proj, sizeof s.proj);
+        if (s.on_frame) s.on_frame(&s);
+        memcpy(g_st_view, s.eye_view, sizeof g_st_view);
+        g_st_tag = s.flat_frame ? 0 : s.tag;
+        g_st_flat_frame = s.flat_frame;
+        g_st_latched = 1;
+        g_st_kvalid = 0;
+        stereo_fx_latch();
+        if (g_st_trace && g_st_trace_on) {
+            fprintf(g_st_trace, "latched: tag %u%s, fov scale %.2f / %.2f\n", g_st_tag,
+                    s.flat_frame ? ", a flat frame (drawn as the game drew it)" : "",
+                    (double)s.fov_scale, (double)s.fov_scale_y);
+            st_trace_mat("proj", g_proj);
+            st_trace_mat("eye_view L", s.eye_view[0]);
+            st_trace_mat("eye_view R", s.eye_view[1]);
+        }
+    }
+    if (!g_stereo.eye_views) return persp && !g_st_flat ? ST_MOVE : ST_SAME;
+    if (g_st_latched && g_st_flat_frame) return ST_SAME;
+    if (persp && !g_st_flat) return ST_MOVE;
+    if (!g_st_latched || !g_st_3d_fb || g_fb != g_st_3d_fb || g_clear || !n || n > 65536) return ST_SAME;
+    if (g_st_flat) {                                   /* the HUD pass on the 3D target */
+        const int panel_layer = !persp || (g_stereo.hud_panel && g_stereo.hud_panel(buf[0].clip[3]));
+        if (!panel_layer) return ST_HUD;
+        return g_hw && g_hw->draw_hud ? ST_PANEL : ST_SAME;
+    }
+    if (!g_through && g_st_sproj_ok && !st_fullscreen(buf, n)) return ST_FX;   /* the scene pass: effects */
+    return ST_SAME;
+}
+
+/* A HUD-pass label vertex (clip space, the game camera's) for eye `eye`,
+ * into out: back to the game camera's view space along its own direction
+ * (at its own depth), then through the eye. The depth value (z / w) stays
+ * the game's, so depth tests and draw order do too. */
+static void hud_vertex(const float *in, float *out, int eye) {
+    const float *m = g_st_unproj, *P = g_proj;
+    const float rx = in[0] - P[12], ry = in[1] - P[13], rw = in[3] - P[15];
+    const float x = m[0] * rx + m[1] * ry + m[2] * rw;
+    const float y = m[3] * rx + m[4] * ry + m[5] * rw;
+    const float z = m[6] * rx + m[7] * ry + m[8] * rw;
+    const float *k = g_st_ke[eye];
+    for (int r = 0; r < 4; r++) out[r] = k[r] * x + k[4 + r] * y + k[8 + r] * z + k[12 + r];
+    if (fabsf(in[3]) > W_EPS) out[2] = in[2] / in[3] * out[3];
+}
+
+/* A screen-space effect vertex (orthographic: its x, y are the screen
+ * position) for eye `eye`: the point at fx_dist along the scene camera's ray
+ * through that position, through the eye. The depth value stays the game's. */
+static void fx_vertex(const float *in, float *out, int eye) {
+    const float *m = g_st_sunproj, *P = g_st_sproj;
+    const float iw = fabsf(in[3]) > W_EPS ? 1.0f / in[3] : 1.0f;
+    const float d = g_stereo.fx_dist > 0 ? g_stereo.fx_dist : 50.0f;
+    const float rx = in[0] * iw * d - P[12], ry = in[1] * iw * d - P[13], rw = d - P[15];
+    const float x = m[0] * rx + m[1] * ry + m[2] * rw;
+    const float y = m[3] * rx + m[4] * ry + m[5] * rw;
+    const float z = m[6] * rx + m[7] * ry + m[8] * rw;
+    const float *k = g_st_kfx[eye];
+    for (int r = 0; r < 4; r++) out[r] = k[r] * x + k[4 + r] * y + k[8 + r] * z + k[12 + r];
+    out[2] = in[2] * iw * out[3];
+}
+
+/* A ST_HUD draw clipped to a window (a scissor smaller than the screen): the
+ * window's corners, at the draw's depth, moved as its vertices are
+ * (hud_vertex), and the scissor set to their bounds, so what the game clips
+ * to the window stays in it. Undone by hud_scissor_restore. */
+static int g_st_sc_set, g_st_sc_old[4];
+static uint64_t g_st_sc_moved;
+static void hud_scissor(const pvtx *buf, uint32_t n, int eye) {
+    if (!n || (g_sx0 <= 0 && g_sy0 <= 0 && g_sx1 >= 479 && g_sy1 >= 271) || !stereo_kmat() || !g_st_unproj_ok) return;
+    const float w = buf[0].clip[3], z = buf[0].clip[2];
+    if (w <= W_EPS) return;
+    const float sxs = ge_float(R[0x42]), sys = ge_float(R[0x43]);
+    const float cx = ge_float(R[0x45]) - (float)(R[0x4C] & 0xFFFF) / 16.0f;
+    const float cy = ge_float(R[0x46]) - (float)(R[0x4D] & 0xFFFF) / 16.0f;
+    if (fabsf(sxs) < 1e-6f || fabsf(sys) < 1e-6f) return;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (int i = 0; i < 4; i++) {
+        const float px = (float)((i & 1) ? g_sx1 + 1 : g_sx0), py = (float)((i & 2) ? g_sy1 + 1 : g_sy0);
+        const float in[4] = { (px - cx) / sxs * w, (py - cy) / sys * w, z, w };
+        float out[4];
+        hud_vertex(in, out, eye);
+        if (out[3] <= W_EPS) return;                            /* behind the eye: leave it */
+        const float sx = out[0] / out[3] * sxs + cx, sy = out[1] / out[3] * sys + cy;
+        if (sx < x0) x0 = sx;
+        if (sx > x1) x1 = sx;
+        if (sy < y0) y0 = sy;
+        if (sy > y1) y1 = sy;
+    }
+    g_st_sc_old[0] = g_sx0; g_st_sc_old[1] = g_sy0; g_st_sc_old[2] = g_sx1; g_st_sc_old[3] = g_sy1;
+    g_st_sc_set = 1;
+    g_sx0 = clampi((int)floorf(x0), 0, 511); g_sy0 = clampi((int)floorf(y0), 0, 511);
+    g_sx1 = clampi((int)ceilf(x1) - 1, 0, 511); g_sy1 = clampi((int)ceilf(y1) - 1, 0, 511);
+    if (g_sx1 < g_sx0) g_sx1 = g_sx0;
+    if (g_sy1 < g_sy0) g_sy1 = g_sy0;
+    g_st_sc_moved++;
+}
+static void hud_scissor_restore(void) {
+    if (!g_st_sc_set) return;
+    g_sx0 = g_st_sc_old[0]; g_sy0 = g_st_sc_old[1]; g_sx1 = g_st_sc_old[2]; g_sy1 = g_st_sc_old[3];
+    g_st_sc_set = 0;
+}
+
+static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, int eye, int mode);
+
+static void st_bbox(const pvtx *b, uint32_t n, float *r) {
+    r[0] = r[1] = 1e9f; r[2] = r[3] = -1e9f;
+    for (uint32_t i = 0; i < n; i++) {
+        if (b[i].clip[3] <= W_EPS && !g_through) continue;
+        if (b[i].s.x < r[0]) r[0] = b[i].s.x;
+        if (b[i].s.y < r[1]) r[1] = b[i].s.y;
+        if (b[i].s.x > r[2]) r[2] = b[i].s.x;
+        if (b[i].s.y > r[3]) r[3] = b[i].s.y;
+    }
+}
+
+/* One traced draw: what stereo does with it (moved 3D scene draws are only
+ * counted). For the left eye: its screen box before and after, and the
+ * scissor before and after. */
+static void st_trace_draw(uint32_t type, const pvtx *buf, uint32_t n, int shift) {
+    static const char *const KIND[] = { "same", "move", "world", "panel", "fx" };
+    g_st_trace_n++;
+    if (shift == ST_MOVE) { g_st_trace_moved++; return; }
+    float before[4], after[4];
+    st_bbox(buf, n, before);
+    memcpy(after, before, sizeof after);
+    int sc[4] = { g_sx0, g_sy0, g_sx1, g_sy1 };
+    if ((shift == ST_HUD || shift == ST_FX) && n <= 65536) {
+        eye_shift(buf, g_lbuf, n, 0, shift);
+        st_bbox(g_lbuf, n, after);
+        if (shift == ST_HUD) {
+            hud_scissor(buf, n, 0);
+            sc[0] = g_sx0; sc[1] = g_sy0; sc[2] = g_sx1; sc[3] = g_sy1;
+            hud_scissor_restore();
+        }
+    }
+    fprintf(g_st_trace, "  #%-4u %-6s prim %u x%-5u fb 0x%06X%s%s w %8.2f box %6.1f,%6.1f-%6.1f,%6.1f -> %7.1f,%7.1f-%7.1f,%7.1f"
+            " scissor %d,%d-%d,%d -> %d,%d-%d,%d\n",
+            g_st_trace_n, KIND[shift < 5 ? shift : 0], type, n, g_fb, g_through ? " through" : "", g_st_flat ? " hudpass" : "",
+            n ? (double)buf[0].clip[3] : 0.0,
+            (double)before[0], (double)before[1], (double)before[2], (double)before[3],
+            (double)after[0], (double)after[1], (double)after[2], (double)after[3],
+            g_sx0, g_sy0, g_sx1, g_sy1, sc[0], sc[1], sc[2], sc[3]);
+}
+
 /* buf as eye `eye` (0 left, 1 right) sees it, into out: at view-space
- * x = -/+half_ipd (the IPD shift), or through its eye_view matrix; mode
- * ST_HUD keeps each vertex's depth value (z / w), so the HUD's depth tests
- * and draw order stay the game's. */
+ * x = -/+half_ipd (the IPD shift), or through its eye_view matrix (ST_HUD:
+ * hud_vertex, ST_FX: fx_vertex). */
 static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, int eye, int mode) {
     const float *p = g_proj;
     const float c = eye ? g_stereo.half_ipd : -g_stereo.half_ipd;
-    const int views = g_stereo.eye_views && stereo_kmat();
+    const int kmat = g_stereo.eye_views && stereo_kmat();
+    const int hud = kmat && mode == ST_HUD && g_st_unproj_ok;
+    const int fx = kmat && mode == ST_FX && g_st_sproj_ok;
+    const int views = kmat && (hud || fx || g_st_k_ok);
     const float *k = g_st_k[eye];
+    if (eye == 0 || !g_stereo.mono_is_left) { if (hud) g_st_hud_draws++; if (fx) g_st_fx_draws++; }
     for (uint32_t i = 0; i < n; i++) {
         pvtx *o = &out[i];
         *o = buf[i];
-        if (views) {
+        if (hud || fx) {
+            float c4[4];
+            if (hud) hud_vertex(buf[i].clip, c4, eye);
+            else fx_vertex(buf[i].clip, c4, eye);
+            memcpy(o->clip, c4, sizeof c4);
+        } else if (views) {
             const float x = o->clip[0], y = o->clip[1], z = o->clip[2], w = o->clip[3];
             for (int r = 0; r < 4; r++) o->clip[r] = k[r] * x + k[4 + r] * y + k[8 + r] * z + k[12 + r] * w;
-            if (mode == ST_HUD && fabsf(w) > W_EPS) o->clip[2] = z / w * o->clip[3];
         } else {
             const float dist = (o->clip[3] - p[15]) / -p[11];
             const float d = c * (dist / g_stereo.converge - 1.0f);
@@ -2111,36 +2352,39 @@ static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, int eye, int mode)
  * two pictures instead of three. */
 static pvtx g_lbuf[65536];
 static const pvtx *stereo_mono(const pvtx *buf, uint32_t n, int shift) {
-    if (shift == ST_SHRINK) {                           /* shrunk to the game's view */
-        const float wx = 1.0f / stereo_fov_x(), wy = 1.0f / stereo_fov_y();
-        for (uint32_t i = 0; i < n; i++) {
-            pvtx *o = &g_lbuf[i];
-            *o = buf[i];
-            o->clip[0] *= wx; o->clip[1] *= wy;
-            if (o->clip[3] > W_EPS) to_screen(o->clip, &o->s);
-            else o->s.w = 0;
-        }
-        return g_lbuf;
-    }
-    if (shift == ST_SAME || !g_stereo.mono_is_left) return buf;
+    if (shift == ST_SAME || shift == ST_PANEL || !g_stereo.mono_is_left) return buf;
+    if (shift == ST_HUD) hud_scissor(buf, n, 0);        /* undone after hw_draw */
     eye_shift(buf, g_lbuf, n, 0, shift);
     return g_lbuf;
+}
+
+/* ST_PANEL: the draw as the game made it, to the backend's HUD picture. */
+static void hw_draw_hud(uint32_t type, const pvtx *buf, uint32_t n) {
+    g_hwn = 0;
+    if (type <= 2) collect_points_lines(type, buf, n);
+    else if (type <= 6) { g_collect = 1; rasterize_rows(type, buf, n); g_collect = 0; }
+    if (!g_hwn) return;
+    psp_gpu_state st;
+    fill_hw_state(&st);
+    if (g_hw->draw_hud(&st, g_hwv, g_hwn) == 0) g_st_panel_draws++;
 }
 
 static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n, int shift) {
     psp_gpu_state st;
     fill_hw_state(&st);
     const int first = g_stereo.mono_is_left ? 1 : 0;   /* the left eye was the mono draw */
-    if (shift == ST_SAME || shift == ST_SHRINK) {       /* both eyes see what the mono draw got */
+    if (shift == ST_SAME) {                             /* both eyes see what the mono draw got */
         for (int eye = first; eye < 2; eye++) { g_hw->draw_eye(eye, &st, g_hwv, g_hwn); g_eye_draws++; }
         return;
     }
     for (int eye = first; eye < 2; eye++) {
+        if (shift == ST_HUD) { hud_scissor(buf, n, eye); fill_hw_state(&st); }
         eye_shift(buf, g_ebuf, n, eye, shift);
         g_hwn = 0;
         if (type <= 2) collect_points_lines(type, g_ebuf, n);
         else if (type <= 6) { g_collect = 1; rasterize_rows(type, g_ebuf, n); g_collect = 0; }
         if (g_hwn) { g_hw->draw_eye(eye, &st, g_hwv, g_hwn); g_eye_draws++; }
+        if (g_st_sc_set) { hud_scissor_restore(); fill_hw_state(&st); }
     }
 }
 
@@ -2250,6 +2494,10 @@ void psp_gpu_dump_stats(FILE *out) {
     if (g_hw) fprintf(out, "    hardware backend %s: %llu draws, %llu fell back to software\n", g_hw->name,
             (unsigned long long)g_hw_draws, (unsigned long long)g_hw_fallback);
     if (g_eye_draws) fprintf(out, "    stereo: %llu draws replayed for an eye\n", (unsigned long long)g_eye_draws);
+    if (g_st_hud_draws || g_st_panel_draws || g_st_fx_draws)
+        fprintf(out, "    stereo: HUD pass %llu draws on the panel, %llu labels in the world (%llu scissors moved); %llu effects placed in the world\n",
+                (unsigned long long)g_st_panel_draws, (unsigned long long)g_st_hud_draws, (unsigned long long)g_st_sc_moved,
+                (unsigned long long)g_st_fx_draws);
     fprintf(out, "    render threads %d; draws split across them %llu, drawn on one %llu\n",
             g_nworkers, (unsigned long long)g_parallel_draws, (unsigned long long)g_serial_draws);
     fprintf(out, "    draws %llu (%llu textured), %llu triangles culled, %llu clipped\n",
