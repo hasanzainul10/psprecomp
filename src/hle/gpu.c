@@ -2051,10 +2051,10 @@ uint32_t psp_gpu_stereo_tag(void) {
 /* eye_views with fov_scale(_y) > 1: the eyes see a wider view than the
  * game's (clip x and y divided by the scales). */
 static float stereo_fov_x(void) {
-    return g_stereo.eye_views && g_stereo.fov_scale > 1.0f ? g_stereo.fov_scale : 1.0f;
+    return g_stereo.eye_views && g_stereo.fov_scale > 0.01f ? g_stereo.fov_scale : 1.0f;
 }
 static float stereo_fov_y(void) {
-    return g_stereo.eye_views && g_stereo.fov_scale_y > 1.0f ? g_stereo.fov_scale_y : stereo_fov_x();
+    return g_stereo.eye_views && g_stereo.fov_scale_y > 0.01f ? g_stereo.fov_scale_y : stereo_fov_x();
 }
 
 /* Column-major 4x4: out = a * b. */
@@ -2192,6 +2192,8 @@ static int stereo_classify(const pvtx *buf, uint32_t n) {
         memcpy(g_st_view, s.eye_view, sizeof g_st_view);
         g_stereo.near_w = s.near_w;                     /* on_frame may set these per frame too */
         g_stereo.fx_dist = s.fx_dist;
+        g_stereo.fov_scale = s.fov_scale;               /* below 1 when the game's own view is wider */
+        g_stereo.fov_scale_y = s.fov_scale_y;
         g_st_tag = s.flat_frame ? 0 : s.tag;
         g_st_flat_frame = s.flat_frame;
         g_st_latched = 1;
