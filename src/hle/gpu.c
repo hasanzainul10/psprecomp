@@ -1371,6 +1371,9 @@ static int g_verify = -1;
 static void rasterize(uint32_t type, const pvtx *buf, uint32_t n);
 static void verify_rasterize(uint32_t type, const pvtx *buf, uint32_t n);
 static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n);
+static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n);
+static psp_gpu_stereo g_stereo;
+static int g_hw_ok;                       /* the last hw_draw went to the backend (not software) */
 
 void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr) {
     const uint32_t vt = R[0x12];
@@ -1449,7 +1452,11 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
         g_observer(&di);
     }
     dump_draw(type, n, buf);
-    if (g_hw && !g_ref) { hw_draw(type, buf, n); return; }
+    if (g_hw && !g_ref) {
+        hw_draw(type, buf, n);
+        if (g_stereo.on && g_hw->draw_eye && g_hw_ok) hw_draw_eyes(type, buf, n);
+        return;
+    }
     /* PSP2I_GPU_VERIFY=N checks every Nth primitive (1 = all of them). */
     if (g_verify < 0) { const char *e = getenv("PSP2I_GPU_VERIFY"); g_verify = e ? (atoi(e) > 0 ? atoi(e) : 1) : 0; }
     static uint64_t nth;
@@ -1901,13 +1908,14 @@ static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n) {
     if (g_through && g_tex && tex_h(0) == 512)
         for (uint32_t i = 0; i < n; i++)
             if (buf[i].s.v > (float)g_draw_maxv) g_draw_maxv = (uint32_t)buf[i].s.v;
+    g_hw_ok = 0;
     if (type <= 2) {
         g_hwn = 0;
         collect_points_lines(type, buf, n);
         if (!g_hwn) return 1;
         psp_gpu_state st;
         fill_hw_state(&st);
-        if (g_hw->draw(&st, g_hwv, g_hwn) == 0) { g_hw_draws++; return 1; }
+        if (g_hw->draw(&st, g_hwv, g_hwn) == 0) { g_hw_draws++; g_hw_ok = 1; return 1; }
         g_hw_fallback++;
     } else if (type <= 6) {
         g_collect = 1;
@@ -1917,7 +1925,7 @@ static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n) {
         if (!g_hwn) return 1;
         psp_gpu_state st;
         fill_hw_state(&st);
-        if (g_hw->draw(&st, g_hwv, g_hwn) == 0) { g_hw_draws++; return 1; }
+        if (g_hw->draw(&st, g_hwv, g_hwn) == 0) { g_hw_draws++; g_hw_ok = 1; return 1; }
         g_hw_fallback++;
     }
     if (g_fbw) g_hw->sync_vram(g_fb, fb_span());
@@ -1926,6 +1934,69 @@ static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n) {
     if (g_fbw) g_hw->vram_written(g_fb, fb_span());
     if (g_zbw) g_hw->vram_written(g_zb, zb_span());
     return 1;
+}
+
+/* ---- stereo: the draw again per eye ---------------------------------------------
+ *
+ * The draw's vertices are already in clip space for the game's camera. An eye
+ * at view-space x = c sees a vertex at view distance `dist` where the game's
+ * camera would see it moved by c * (dist / D - 1) along view x: its own
+ * position (-c) plus the off-axis shift (c * dist / D) that puts distance D
+ * at zero disparity. In clip space that is that much of PROJ's first column.
+ * Skinning, lighting and texture coordinates are not redone. */
+static pvtx  g_ebuf[65536];
+static float g_stereo_tan;
+static uint64_t g_eye_draws;
+
+void psp_gpu_set_stereo(const psp_gpu_stereo *s) {
+    if (s) g_stereo = *s;
+    else memset(&g_stereo, 0, sizeof g_stereo);
+}
+
+float psp_gpu_stereo_tan_half_fov(void) { return g_stereo_tan; }
+
+/* The HUD pass (flat_after_clear): PSP2i draws its HUD as perspective quads
+ * 64-86 units away, after clearing the scene buffer a second time in the
+ * frame. So once a target that took perspective draws is cleared again, the
+ * rest of the frame is drawn flat. The frame is the draws between flips. */
+static uint64_t g_st_flip = (uint64_t)-1;
+static uint32_t g_st_3d_fb;                /* the target of this frame's perspective draws, 0 = none */
+static int      g_st_flat;
+
+static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n) {
+    const float *p = g_proj;
+    const uint64_t flip = psp_display_flips();
+    if (flip != g_st_flip) { g_st_flip = flip; g_st_3d_fb = 0; g_st_flat = 0; }
+    if (g_clear && g_st_3d_fb && g_fb == g_st_3d_fb && g_stereo.flat_after_clear) g_st_flat = 1;
+    /* Perspective: w grows with distance. Orthographic draws (bloom and blur
+     * passes) and the HUD pass stay at screen depth, like through-mode ones. */
+    const int persp = !g_through && fabsf(p[11]) > 1e-6f && g_stereo.converge > 0 && n <= 65536;
+    if (persp && !g_st_flat) g_st_3d_fb = g_fb;
+    const int shift = persp && !g_st_flat;
+    psp_gpu_state st;
+    fill_hw_state(&st);
+    if (!shift) {                                       /* both eyes see what the mono draw got */
+        for (int eye = 0; eye < 2; eye++) g_hw->draw_eye(eye, &st, g_hwv, g_hwn);
+        g_eye_draws += 2;
+        return;
+    }
+    if (p[0] != 0) g_stereo_tan = 1.0f / fabsf(p[0]);
+    for (int eye = 0; eye < 2; eye++) {
+        const float c = eye ? g_stereo.half_ipd : -g_stereo.half_ipd;
+        for (uint32_t i = 0; i < n; i++) {
+            pvtx *o = &g_ebuf[i];
+            *o = buf[i];
+            const float dist = (o->clip[3] - p[15]) / -p[11];
+            const float d = c * (dist / g_stereo.converge - 1.0f);
+            for (int k = 0; k < 4; k++) o->clip[k] += d * p[k];
+            if (o->clip[3] > W_EPS) to_screen(o->clip, &o->s);
+            else o->s.w = 0;
+        }
+        g_hwn = 0;
+        if (type <= 2) collect_points_lines(type, g_ebuf, n);
+        else if (type <= 6) { g_collect = 1; rasterize_rows(type, g_ebuf, n); g_collect = 0; }
+        if (g_hwn) { g_hw->draw_eye(eye, &st, g_hwv, g_hwn); g_eye_draws++; }
+    }
 }
 
 /* ---- block transfer ------------------------------------------------------------- */
@@ -2033,6 +2104,7 @@ void psp_gpu_dump_stats(FILE *out) {
             (unsigned long long)c_blend, (unsigned long long)c_clear);
     if (g_hw) fprintf(out, "    hardware backend %s: %llu draws, %llu fell back to software\n", g_hw->name,
             (unsigned long long)g_hw_draws, (unsigned long long)g_hw_fallback);
+    if (g_eye_draws) fprintf(out, "    stereo: %llu draws replayed for an eye\n", (unsigned long long)g_eye_draws);
     fprintf(out, "    render threads %d; draws split across them %llu, drawn on one %llu\n",
             g_nworkers, (unsigned long long)g_parallel_draws, (unsigned long long)g_serial_draws);
     fprintf(out, "    draws %llu (%llu textured), %llu triangles culled, %llu clipped\n",

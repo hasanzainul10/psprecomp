@@ -115,7 +115,31 @@ typedef struct {
     /* Nonzero: the backend keeps VRAM coherent on every CPU access itself
      * (psp_mem_set_vram_hook), so a GE sync needs no flush. */
     int  coherent_on_access;
+    /* Optional (stereo, psp_gpu_set_stereo): the draw just handed to draw()
+     * again for one eye (0 left, 1 right), with the same state and that eye's
+     * vertices. Only after draw() accepted it. NULL = no stereo. */
+    int  (*draw_eye)(int eye, const psp_gpu_state *st, const psp_gpu_vertex *v, int nverts);
 } psp_gpu_backend;
+
+/* Stereo for the host's VR: after each draw the backend accepted, the GE
+ * draws it again once per eye (draw_eye). Perspective draws move per eye:
+ * an eye at view-space x = -half_ipd (left) or +half_ipd (right), with an
+ * off-axis shift so that points at view distance `converge` have no
+ * disparity. Through-mode and orthographic draws are the same in both eyes.
+ * Units are the game's view-space units. NULL or on = 0: off.
+ * flat_after_clear: once a target that took moved (perspective) draws is
+ * cleared again within a frame, the rest of the frame stays flat too (games
+ * that draw their HUD in 3D after a second clear, as PSP2i does). */
+typedef struct {
+    int   on;
+    float half_ipd;
+    float converge;
+    int   flat_after_clear;
+} psp_gpu_stereo;
+void psp_gpu_set_stereo(const psp_gpu_stereo *s);
+/* The horizontal half-FOV tangent (1/PROJ[0]) of the last perspective draw
+ * replayed for the eyes, 0 if none yet. */
+float psp_gpu_stereo_tan_half_fov(void);
 
 void psp_gpu_set_backend(const psp_gpu_backend *be);   /* NULL = software */
 const psp_gpu_backend *psp_gpu_get_backend(void);
