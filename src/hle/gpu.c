@@ -1966,31 +1966,110 @@ float psp_gpu_stereo_tan_half_fov(void) { return g_stereo_tan; }
 static uint64_t g_st_flip = (uint64_t)-1;
 static uint32_t g_st_3d_fb;                /* the target of this frame's perspective draws, 0 = none */
 static int      g_st_flat;
+/* eye_views: this frame's eye matrices and tag (latched at its first moved
+ * draw), and each eye's clip-space matrix for the current PROJ. */
+static int      g_st_latched;
+static float    g_st_view[2][16];
+static uint32_t g_st_tag;
+static float    g_st_k[2][16], g_st_kproj[16];
+static int      g_st_kvalid;
+
+uint32_t psp_gpu_stereo_tag(void) {
+    return g_stereo.on && g_stereo.eye_views && g_st_latched && g_st_flip == psp_display_flips() ? g_st_tag : 0;
+}
 
 /* Per draw, before the mono draw: does this draw move per eye? Also keeps
- * the frame's HUD-pass state (flat_after_clear). */
+ * the frame's HUD-pass state (flat_after_clear) and, with eye_views, latches
+ * the frame's eye matrices at its first moved draw. */
 static int stereo_classify(uint32_t n) {
     const float *p = g_proj;
     const uint64_t flip = psp_display_flips();
-    if (flip != g_st_flip) { g_st_flip = flip; g_st_3d_fb = 0; g_st_flat = 0; }
+    if (flip != g_st_flip) { g_st_flip = flip; g_st_3d_fb = 0; g_st_flat = 0; g_st_latched = 0; }
     if (g_clear && g_st_3d_fb && g_fb == g_st_3d_fb && g_stereo.flat_after_clear) g_st_flat = 1;
     /* Perspective: w grows with distance. Orthographic draws (bloom and blur
      * passes) and the HUD pass stay at screen depth, like through-mode ones. */
-    const int persp = !g_through && fabsf(p[11]) > 1e-6f && g_stereo.converge > 0 && n <= 65536;
+    const int persp = !g_through && fabsf(p[11]) > 1e-6f && (g_stereo.converge > 0 || g_stereo.eye_views) && n <= 65536;
     if (persp && !g_st_flat) g_st_3d_fb = g_fb;
     if (persp && !g_st_flat && p[0] != 0) g_stereo_tan = 1.0f / fabsf(p[0]);
+    if (persp && !g_st_flat && g_stereo.eye_views && !g_st_latched) {
+        psp_gpu_stereo s = g_stereo;
+        if (s.on_frame) s.on_frame(&s);
+        memcpy(g_st_view, s.eye_view, sizeof g_st_view);
+        g_st_tag = s.tag;
+        g_st_latched = 1;
+        g_st_kvalid = 0;
+    }
     return persp && !g_st_flat;
 }
 
-/* buf as the eye at view-space x = c sees it, into out. */
-static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, float c) {
+/* Column-major 4x4: out = a * b. */
+static void mat4_mul(const float *a, const float *b, float *out) {
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            float v = 0;
+            for (int k = 0; k < 4; k++) v += a[k * 4 + r] * b[c * 4 + k];
+            out[c * 4 + r] = v;
+        }
+}
+
+/* General 4x4 inverse (cofactors); 0 if singular. */
+static int mat4_inv(const float *m, float *out) {
+    float t[16];
+    t[0]  =  m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    t[4]  = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    t[8]  =  m[4] * m[9]  * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    t[12] = -m[4] * m[9]  * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    t[1]  = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    t[5]  =  m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    t[9]  = -m[0] * m[9]  * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    t[13] =  m[0] * m[9]  * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    t[2]  =  m[1] * m[6]  * m[15] - m[1] * m[7]  * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7]  - m[13] * m[3] * m[6];
+    t[6]  = -m[0] * m[6]  * m[15] + m[0] * m[7]  * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7]  + m[12] * m[3] * m[6];
+    t[10] =  m[0] * m[5]  * m[15] - m[0] * m[7]  * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7]  - m[12] * m[3] * m[5];
+    t[14] = -m[0] * m[5]  * m[14] + m[0] * m[6]  * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6]  + m[12] * m[2] * m[5];
+    t[3]  = -m[1] * m[6]  * m[11] + m[1] * m[7]  * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9]  * m[2] * m[7]  + m[9]  * m[3] * m[6];
+    t[7]  =  m[0] * m[6]  * m[11] - m[0] * m[7]  * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8]  * m[2] * m[7]  - m[8]  * m[3] * m[6];
+    t[11] = -m[0] * m[5]  * m[11] + m[0] * m[7]  * m[9]  + m[4] * m[1] * m[11] - m[4] * m[3] * m[9]  - m[8]  * m[1] * m[7]  + m[8]  * m[3] * m[5];
+    t[15] =  m[0] * m[5]  * m[10] - m[0] * m[6]  * m[9]  - m[4] * m[1] * m[10] + m[4] * m[2] * m[9]  + m[8]  * m[1] * m[6]  - m[8]  * m[2] * m[5];
+    const float det = m[0] * t[0] + m[1] * t[4] + m[2] * t[8] + m[3] * t[12];
+    if (fabsf(det) < 1e-20f) return 0;
+    for (int i = 0; i < 16; i++) out[i] = t[i] / det;
+    return 1;
+}
+
+/* eye_views: each eye's clip-space matrix PROJ * eye_view * PROJ^-1 (the
+ * vertices are already in the game's clip space), redone when PROJ changes. */
+static int stereo_kmat(void) {
+    if (g_st_kvalid && !memcmp(g_st_kproj, g_proj, sizeof g_st_kproj)) return 1;
+    float inv[16], t[16];
+    if (!mat4_inv(g_proj, inv)) return 0;
+    for (int e = 0; e < 2; e++) {
+        mat4_mul(g_st_view[e], inv, t);
+        mat4_mul(g_proj, t, g_st_k[e]);
+    }
+    memcpy(g_st_kproj, g_proj, sizeof g_st_kproj);
+    g_st_kvalid = 1;
+    return 1;
+}
+
+/* buf as eye `eye` (0 left, 1 right) sees it, into out: at view-space
+ * x = -/+half_ipd (the IPD shift), or through its eye_view matrix. */
+static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, int eye) {
     const float *p = g_proj;
+    const float c = eye ? g_stereo.half_ipd : -g_stereo.half_ipd;
+    const int views = g_stereo.eye_views && stereo_kmat();
+    const float *k = g_st_k[eye];
     for (uint32_t i = 0; i < n; i++) {
         pvtx *o = &out[i];
         *o = buf[i];
-        const float dist = (o->clip[3] - p[15]) / -p[11];
-        const float d = c * (dist / g_stereo.converge - 1.0f);
-        for (int k = 0; k < 4; k++) o->clip[k] += d * p[k];
+        if (views) {
+            const float x = o->clip[0], y = o->clip[1], z = o->clip[2], w = o->clip[3];
+            for (int r = 0; r < 4; r++) o->clip[r] = k[r] * x + k[4 + r] * y + k[8 + r] * z + k[12 + r] * w;
+        } else {
+            const float dist = (o->clip[3] - p[15]) / -p[11];
+            const float d = c * (dist / g_stereo.converge - 1.0f);
+            for (int r = 0; r < 4; r++) o->clip[r] += d * p[r];
+        }
         if (o->clip[3] > W_EPS) to_screen(o->clip, &o->s);
         else o->s.w = 0;
     }
@@ -2001,7 +2080,7 @@ static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, float c) {
 static pvtx g_lbuf[65536];
 static const pvtx *stereo_mono(const pvtx *buf, uint32_t n, int shift) {
     if (!shift || !g_stereo.mono_is_left) return buf;
-    eye_shift(buf, g_lbuf, n, -g_stereo.half_ipd);
+    eye_shift(buf, g_lbuf, n, 0);
     return g_lbuf;
 }
 
@@ -2014,7 +2093,7 @@ static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n, int shift) 
         return;
     }
     for (int eye = first; eye < 2; eye++) {
-        eye_shift(buf, g_ebuf, n, eye ? g_stereo.half_ipd : -g_stereo.half_ipd);
+        eye_shift(buf, g_ebuf, n, eye);
         g_hwn = 0;
         if (type <= 2) collect_points_lines(type, g_ebuf, n);
         else if (type <= 6) { g_collect = 1; rasterize_rows(type, g_ebuf, n); g_collect = 0; }

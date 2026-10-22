@@ -132,18 +132,32 @@ typedef struct {
  * that draw their HUD in 3D after a second clear, as PSP2i does).
  * mono_is_left: the backend's own draw (draw()) is the left eye's and
  * draw_eye is called for the right eye only: two pictures instead of three,
- * at the price of VRAM and the flat picture showing the left eye. */
-typedef struct {
+ * at the price of VRAM and the flat picture showing the left eye.
+ * eye_views (head tracking): instead of the IPD shift, each eye sees the
+ * view-space vertices through its own rigid 4x4 eye_view[eye] (column-major,
+ * the game's view space to the eye's, game units); half_ipd and converge are
+ * then unused. on_frame, if set, is called at the first moved draw of each
+ * frame (the draws between two flips) to fill eye_view and tag; the whole
+ * frame keeps them, so one frame never mixes two head poses. tag is the
+ * host's name for that pose (psp_gpu_stereo_tag). */
+typedef struct psp_gpu_stereo {
     int   on;
     float half_ipd;
     float converge;
     int   flat_after_clear;
     int   mono_is_left;
+    int   eye_views;
+    float eye_view[2][16];
+    uint32_t tag;
+    void (*on_frame)(struct psp_gpu_stereo *s);
 } psp_gpu_stereo;
 void psp_gpu_set_stereo(const psp_gpu_stereo *s);
 /* The horizontal half-FOV tangent (1/PROJ[0]) of the last perspective draw
  * replayed for the eyes, 0 if none yet. */
 float psp_gpu_stereo_tan_half_fov(void);
+/* eye_views: the tag of the frame being drawn, 0 while it has had no moved
+ * draw yet (or eye_views is off). Backends keep it with their eye pictures. */
+uint32_t psp_gpu_stereo_tag(void);
 
 void psp_gpu_set_backend(const psp_gpu_backend *be);   /* NULL = software */
 const psp_gpu_backend *psp_gpu_get_backend(void);
