@@ -139,7 +139,14 @@ typedef struct {
  * then unused. on_frame, if set, is called at the first moved draw of each
  * frame (the draws between two flips) to fill eye_view and tag; the whole
  * frame keeps them, so one frame never mixes two head poses. tag is the
- * host's name for that pose (psp_gpu_stereo_tag). */
+ * host's name for that pose (psp_gpu_stereo_tag).
+ * fov_scale, fov_scale_y (with eye_views; <= 1: off, and fov_scale_y <= 1
+ * takes fov_scale): the eyes see that many times the game's view across and
+ * up (the tangents of its FOV). With eye_views the HUD pass (after the
+ * second clear of the 3D target, flat_after_clear) is seen from the eyes too,
+ * keeping its depth values, so it keeps the game's size and its labels stay
+ * on what they label; its non-perspective draws are shrunk to the game's
+ * view instead. */
 typedef struct psp_gpu_stereo {
     int   on;
     float half_ipd;
@@ -148,6 +155,7 @@ typedef struct psp_gpu_stereo {
     int   mono_is_left;
     int   eye_views;
     float eye_view[2][16];
+    float fov_scale, fov_scale_y;
     uint32_t tag;
     void (*on_frame)(struct psp_gpu_stereo *s);
 } psp_gpu_stereo;

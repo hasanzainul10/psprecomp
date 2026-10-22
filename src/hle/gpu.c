@@ -1978,9 +1978,31 @@ uint32_t psp_gpu_stereo_tag(void) {
     return g_stereo.on && g_stereo.eye_views && g_st_latched && g_st_flip == psp_display_flips() ? g_st_tag : 0;
 }
 
-/* Per draw, before the mono draw: does this draw move per eye? Also keeps
- * the frame's HUD-pass state (flat_after_clear) and, with eye_views, latches
- * the frame's eye matrices at its first moved draw. */
+/* eye_views with fov_scale(_y) > 1: the eyes see a wider view than the
+ * game's (clip x and y divided by the scales). */
+static float stereo_fov_x(void) {
+    return g_stereo.eye_views && g_stereo.fov_scale > 1.0f ? g_stereo.fov_scale : 1.0f;
+}
+static float stereo_fov_y(void) {
+    return g_stereo.eye_views && g_stereo.fov_scale_y > 1.0f ? g_stereo.fov_scale_y : stereo_fov_x();
+}
+
+/* Per draw, before the mono draw: what the eyes do with it.
+ *   ST_SAME   the same in both eyes (through-mode, orthographic: screen depth)
+ *   ST_MOVE   moved per eye (the 3D scene)
+ *   ST_HUD    eye_views: the HUD pass (after the second clear of the 3D
+ *             target) moved per eye too, keeping each vertex's depth value.
+ *             PSP2i draws the HUD and its world labels (names, the lock-on
+ *             reticle) there as flat perspective sheets already projected
+ *             for the game camera; seen from the head they keep their
+ *             direction, so labels stay on what they label and the HUD stays
+ *             in front of the game camera (the body), not the eyes.
+ *   ST_SHRINK eye_views, wider view: other HUD-pass draws on the 3D target,
+ *             shrunk so they keep the game's size and place. Draws to other
+ *             targets (the final copy to the display buffer) stay as they are.
+ * Also keeps the frame's HUD-pass state (flat_after_clear) and, with
+ * eye_views, latches the frame's eye matrices at its first moved draw. */
+enum { ST_SAME, ST_MOVE, ST_HUD, ST_SHRINK };
 static int stereo_classify(uint32_t n) {
     const float *p = g_proj;
     const uint64_t flip = psp_display_flips();
@@ -1989,6 +2011,7 @@ static int stereo_classify(uint32_t n) {
     /* Perspective: w grows with distance. Orthographic draws (bloom and blur
      * passes) and the HUD pass stay at screen depth, like through-mode ones. */
     const int persp = !g_through && fabsf(p[11]) > 1e-6f && (g_stereo.converge > 0 || g_stereo.eye_views) && n <= 65536;
+    const int hud = g_st_flat && !g_through && g_fb == g_st_3d_fb && g_stereo.eye_views && n <= 65536;
     if (persp && !g_st_flat) g_st_3d_fb = g_fb;
     if (persp && !g_st_flat && p[0] != 0) g_stereo_tan = 1.0f / fabsf(p[0]);
     if (persp && !g_st_flat && g_stereo.eye_views && !g_st_latched) {
@@ -1999,7 +2022,10 @@ static int stereo_classify(uint32_t n) {
         g_st_latched = 1;
         g_st_kvalid = 0;
     }
-    return persp && !g_st_flat;
+    if (persp && !g_st_flat) return ST_MOVE;
+    if (hud && persp && g_st_latched) return ST_HUD;
+    if (hud && (stereo_fov_x() > 1.0f || stereo_fov_y() > 1.0f)) return ST_SHRINK;
+    return ST_SAME;
 }
 
 /* Column-major 4x4: out = a * b. */
@@ -2037,15 +2063,18 @@ static int mat4_inv(const float *m, float *out) {
     return 1;
 }
 
-/* eye_views: each eye's clip-space matrix PROJ * eye_view * PROJ^-1 (the
- * vertices are already in the game's clip space), redone when PROJ changes. */
+/* eye_views: each eye's clip-space matrix S * PROJ * eye_view * PROJ^-1
+ * (the vertices are already in the game's clip space; S widens the view by
+ * fov_scale), redone when PROJ changes. */
 static int stereo_kmat(void) {
     if (g_st_kvalid && !memcmp(g_st_kproj, g_proj, sizeof g_st_kproj)) return 1;
     float inv[16], t[16];
     if (!mat4_inv(g_proj, inv)) return 0;
+    const float wx = 1.0f / stereo_fov_x(), wy = 1.0f / stereo_fov_y();
     for (int e = 0; e < 2; e++) {
         mat4_mul(g_st_view[e], inv, t);
         mat4_mul(g_proj, t, g_st_k[e]);
+        for (int c = 0; c < 4; c++) { g_st_k[e][c * 4] *= wx; g_st_k[e][c * 4 + 1] *= wy; }
     }
     memcpy(g_st_kproj, g_proj, sizeof g_st_kproj);
     g_st_kvalid = 1;
@@ -2053,8 +2082,10 @@ static int stereo_kmat(void) {
 }
 
 /* buf as eye `eye` (0 left, 1 right) sees it, into out: at view-space
- * x = -/+half_ipd (the IPD shift), or through its eye_view matrix. */
-static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, int eye) {
+ * x = -/+half_ipd (the IPD shift), or through its eye_view matrix; mode
+ * ST_HUD keeps each vertex's depth value (z / w), so the HUD's depth tests
+ * and draw order stay the game's. */
+static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, int eye, int mode) {
     const float *p = g_proj;
     const float c = eye ? g_stereo.half_ipd : -g_stereo.half_ipd;
     const int views = g_stereo.eye_views && stereo_kmat();
@@ -2065,6 +2096,7 @@ static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, int eye) {
         if (views) {
             const float x = o->clip[0], y = o->clip[1], z = o->clip[2], w = o->clip[3];
             for (int r = 0; r < 4; r++) o->clip[r] = k[r] * x + k[4 + r] * y + k[8 + r] * z + k[12 + r] * w;
+            if (mode == ST_HUD && fabsf(w) > W_EPS) o->clip[2] = z / w * o->clip[3];
         } else {
             const float dist = (o->clip[3] - p[15]) / -p[11];
             const float d = c * (dist / g_stereo.converge - 1.0f);
@@ -2079,8 +2111,19 @@ static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, int eye) {
  * two pictures instead of three. */
 static pvtx g_lbuf[65536];
 static const pvtx *stereo_mono(const pvtx *buf, uint32_t n, int shift) {
-    if (!shift || !g_stereo.mono_is_left) return buf;
-    eye_shift(buf, g_lbuf, n, 0);
+    if (shift == ST_SHRINK) {                           /* shrunk to the game's view */
+        const float wx = 1.0f / stereo_fov_x(), wy = 1.0f / stereo_fov_y();
+        for (uint32_t i = 0; i < n; i++) {
+            pvtx *o = &g_lbuf[i];
+            *o = buf[i];
+            o->clip[0] *= wx; o->clip[1] *= wy;
+            if (o->clip[3] > W_EPS) to_screen(o->clip, &o->s);
+            else o->s.w = 0;
+        }
+        return g_lbuf;
+    }
+    if (shift == ST_SAME || !g_stereo.mono_is_left) return buf;
+    eye_shift(buf, g_lbuf, n, 0, shift);
     return g_lbuf;
 }
 
@@ -2088,12 +2131,12 @@ static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n, int shift) 
     psp_gpu_state st;
     fill_hw_state(&st);
     const int first = g_stereo.mono_is_left ? 1 : 0;   /* the left eye was the mono draw */
-    if (!shift) {                                       /* both eyes see what the mono draw got */
+    if (shift == ST_SAME || shift == ST_SHRINK) {       /* both eyes see what the mono draw got */
         for (int eye = first; eye < 2; eye++) { g_hw->draw_eye(eye, &st, g_hwv, g_hwn); g_eye_draws++; }
         return;
     }
     for (int eye = first; eye < 2; eye++) {
-        eye_shift(buf, g_ebuf, n, eye);
+        eye_shift(buf, g_ebuf, n, eye, shift);
         g_hwn = 0;
         if (type <= 2) collect_points_lines(type, g_ebuf, n);
         else if (type <= 6) { g_collect = 1; rasterize_rows(type, g_ebuf, n); g_collect = 0; }
