@@ -2305,27 +2305,35 @@ static void st_bbox(const pvtx *b, uint32_t n, float *r) {
     }
 }
 
-/* psp_gpu_stereo_probe: armed, it measures from the next flip to the one
- * after (the frame's moved draws), in the game camera's view space (clip x,
- * y, w through g_st_unproj, as the HUD pass's labels). */
-static float    g_st_probe_at[3], g_st_probe_up[3], g_st_probe_r, g_st_probe_hmax, g_st_probe_res[3];
+/* psp_gpu_stereo_probe: armed, it measures one frame's moved draws (the
+ * next one, or the one being drawn), in the game camera's view space (clip
+ * x, y, w through g_st_unproj, as the HUD pass's labels). Done at the flip
+ * after it. */
+static float    g_st_probe_at[3], g_st_probe_up[3], g_st_probe_r, g_st_probe_hmax, g_st_probe_head;
+static float    g_st_probe_res[6], g_st_probe_hn;
 static uint64_t g_st_probe_flip;
 static int      g_st_probe_done;
 
-void psp_gpu_stereo_probe(const float at[3], const float up[3], float radius, float height_max) {
+void psp_gpu_stereo_probe(const float at[3], const float up[3], float radius, float height_max, float head_from,
+                          int this_frame) {
     memcpy(g_st_probe_at, at, sizeof g_st_probe_at);
     memcpy(g_st_probe_up, up, sizeof g_st_probe_up);
     g_st_probe_r = radius;
     g_st_probe_hmax = height_max;
-    g_st_probe_res[0] = 1e9f; g_st_probe_res[1] = -1e9f; g_st_probe_res[2] = 0;
+    g_st_probe_head = head_from;
+    g_st_probe_res[0] = 1e9f; g_st_probe_res[1] = -1e9f;
+    g_st_probe_res[2] = g_st_probe_res[3] = g_st_probe_res[4] = g_st_probe_res[5] = 0;
+    g_st_probe_hn = 0;
     g_st_probe_done = 0;
-    g_st_probe_flip = 0;
-    g_st_probe_on = 1;
+    g_st_probe_flip = this_frame ? psp_display_flips() : 0;
+    g_st_probe_on = this_frame ? 2 : 1;
 }
 
-int psp_gpu_stereo_probe_result(float out[3]) {
+int psp_gpu_stereo_probe_result(float out[6]) {
+    if (g_st_probe_on == 2 && psp_display_flips() != g_st_probe_flip) { g_st_probe_on = 0; g_st_probe_done = 1; }
     if (!g_st_probe_done) return 0;
-    memcpy(out, g_st_probe_res, sizeof g_st_probe_res);
+    memcpy(out, g_st_probe_res, 3 * sizeof(float));
+    for (int k = 0; k < 3; k++) out[3 + k] = g_st_probe_hn > 0 ? g_st_probe_res[3 + k] / g_st_probe_hn : 0.0f;
     return 1;
 }
 
@@ -2352,6 +2360,10 @@ static void st_probe_draw(const pvtx *buf, uint32_t n) {
         if (h < g_st_probe_res[0]) g_st_probe_res[0] = h;
         if (h > g_st_probe_res[1]) g_st_probe_res[1] = h;
         g_st_probe_res[2] += 1.0f;
+        if (h >= g_st_probe_head) {                             /* the head: its centre */
+            for (int k = 0; k < 3; k++) g_st_probe_res[3 + k] += v[k];
+            g_st_probe_hn += 1.0f;
+        }
     }
 }
 
