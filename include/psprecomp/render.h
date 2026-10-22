@@ -174,6 +174,11 @@ typedef struct psp_gpu_stereo {
     float proj[16];       /* on_frame: the PROJ of the frame's first moved draw (filled by the GE) */
     uint32_t tag;
     void (*on_frame)(struct psp_gpu_stereo *s);
+    /* eye_views (on_frame may set it per frame): the 3D scene's draws are
+     * clipped at this clip w (the eye's depth, in game units) instead of just
+     * in front of the eye; 0 = as before. The host's first person hides the
+     * player's own head with it. */
+    float near_w;
 } psp_gpu_stereo;
 void psp_gpu_set_stereo(const psp_gpu_stereo *s);
 /* The horizontal half-FOV tangent (1/PROJ[0]) of the last perspective draw

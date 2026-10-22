@@ -1243,9 +1243,14 @@ static int culled(const vtx *a, const vtx *b, const vtx *c) {
     return culled_area((b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x));
 }
 
+/* The plane triangles are clipped at: w = W_EPS, just in front of the eye,
+ * or psp_gpu_stereo.near_w for the eyes' 3D scene draws (set around them). */
+static float g_clip_w = W_EPS;
+
 static void emit_tri(const pvtx *a, const pvtx *b, const pvtx *c) {
     if (!g_through) {
-        int in = (a->clip[3] > W_EPS) + (b->clip[3] > W_EPS) + (c->clip[3] > W_EPS);
+        const float cw = g_clip_w;
+        int in = (a->clip[3] > cw) + (b->clip[3] > cw) + (c->clip[3] > cw);
         if (in == 0) { if (tl_k == 0) g_clipped++; return; }
         if (in < 3) {
             /* Sutherland-Hodgman against the single plane w = EPS. */
@@ -1254,10 +1259,10 @@ static void emit_tri(const pvtx *a, const pvtx *b, const pvtx *c) {
             int n = 0;
             for (int i = 0; i < 3; i++) {
                 const pvtx *p = v[i], *q = v[(i + 1) % 3];
-                int pin = p->clip[3] > W_EPS, qin = q->clip[3] > W_EPS;
+                int pin = p->clip[3] > cw, qin = q->clip[3] > cw;
                 if (pin) out[n++] = *p;
                 if (pin != qin) {
-                    float t = (W_EPS - p->clip[3]) / (q->clip[3] - p->clip[3]);
+                    float t = (cw - p->clip[3]) / (q->clip[3] - p->clip[3]);
                     lerp_clip(p, q, t, &out[n++]);
                 }
             }
@@ -1470,9 +1475,12 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
         if (st && g_st_trace && g_st_trace_on) st_trace_draw(type, buf, n, shift);
         if (st && g_st_probe_on && shift == 1) st_probe_draw(buf, n);  /* ST_MOVE: the 3D scene */
         if (st && shift == 3) { hw_draw_hud(type, buf, n); return; }   /* ST_PANEL: the HUD picture only */
+        /* ST_MOVE seen from the eyes: clipped at near_w (first person). */
+        if (st && shift == 1 && g_stereo.eye_views && g_stereo.near_w > W_EPS) g_clip_w = g_stereo.near_w;
         hw_draw(type, st ? stereo_mono(buf, n, shift) : buf, n);
         hud_scissor_restore();
         if (st && g_hw_ok) hw_draw_eyes(type, buf, n, shift);
+        g_clip_w = W_EPS;
         return;
     }
     /* PSP2I_GPU_VERIFY=N checks every Nth primitive (1 = all of them). */
