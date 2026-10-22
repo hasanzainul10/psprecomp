@@ -129,12 +129,16 @@ typedef struct {
  * Units are the game's view-space units. NULL or on = 0: off.
  * flat_after_clear: once a target that took moved (perspective) draws is
  * cleared again within a frame, the rest of the frame stays flat too (games
- * that draw their HUD in 3D after a second clear, as PSP2i does). */
+ * that draw their HUD in 3D after a second clear, as PSP2i does).
+ * mono_is_left: the backend's own draw (draw()) is the left eye's and
+ * draw_eye is called for the right eye only: two pictures instead of three,
+ * at the price of VRAM and the flat picture showing the left eye. */
 typedef struct {
     int   on;
     float half_ipd;
     float converge;
     int   flat_after_clear;
+    int   mono_is_left;
 } psp_gpu_stereo;
 void psp_gpu_set_stereo(const psp_gpu_stereo *s);
 /* The horizontal half-FOV tangent (1/PROJ[0]) of the last perspective draw

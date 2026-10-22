@@ -1371,7 +1371,9 @@ static int g_verify = -1;
 static void rasterize(uint32_t type, const pvtx *buf, uint32_t n);
 static void verify_rasterize(uint32_t type, const pvtx *buf, uint32_t n);
 static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n);
-static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n);
+static int  stereo_classify(uint32_t n);
+static const pvtx *stereo_mono(const pvtx *buf, uint32_t n, int shift);
+static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n, int shift);
 static psp_gpu_stereo g_stereo;
 static int g_hw_ok;                       /* the last hw_draw went to the backend (not software) */
 
@@ -1453,8 +1455,10 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
     }
     dump_draw(type, n, buf);
     if (g_hw && !g_ref) {
-        hw_draw(type, buf, n);
-        if (g_stereo.on && g_hw->draw_eye && g_hw_ok) hw_draw_eyes(type, buf, n);
+        const int st = g_stereo.on && g_hw->draw_eye != NULL;
+        const int shift = st ? stereo_classify(n) : 0;
+        hw_draw(type, st ? stereo_mono(buf, n, shift) : buf, n);
+        if (st && g_hw_ok) hw_draw_eyes(type, buf, n, shift);
         return;
     }
     /* PSP2I_GPU_VERIFY=N checks every Nth primitive (1 = all of them). */
@@ -1963,7 +1967,9 @@ static uint64_t g_st_flip = (uint64_t)-1;
 static uint32_t g_st_3d_fb;                /* the target of this frame's perspective draws, 0 = none */
 static int      g_st_flat;
 
-static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n) {
+/* Per draw, before the mono draw: does this draw move per eye? Also keeps
+ * the frame's HUD-pass state (flat_after_clear). */
+static int stereo_classify(uint32_t n) {
     const float *p = g_proj;
     const uint64_t flip = psp_display_flips();
     if (flip != g_st_flip) { g_st_flip = flip; g_st_3d_fb = 0; g_st_flat = 0; }
@@ -1972,26 +1978,43 @@ static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n) {
      * passes) and the HUD pass stay at screen depth, like through-mode ones. */
     const int persp = !g_through && fabsf(p[11]) > 1e-6f && g_stereo.converge > 0 && n <= 65536;
     if (persp && !g_st_flat) g_st_3d_fb = g_fb;
-    const int shift = persp && !g_st_flat;
+    if (persp && !g_st_flat && p[0] != 0) g_stereo_tan = 1.0f / fabsf(p[0]);
+    return persp && !g_st_flat;
+}
+
+/* buf as the eye at view-space x = c sees it, into out. */
+static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, float c) {
+    const float *p = g_proj;
+    for (uint32_t i = 0; i < n; i++) {
+        pvtx *o = &out[i];
+        *o = buf[i];
+        const float dist = (o->clip[3] - p[15]) / -p[11];
+        const float d = c * (dist / g_stereo.converge - 1.0f);
+        for (int k = 0; k < 4; k++) o->clip[k] += d * p[k];
+        if (o->clip[3] > W_EPS) to_screen(o->clip, &o->s);
+        else o->s.w = 0;
+    }
+}
+
+/* mono_is_left: the game's own picture is the left eye's, so the GPU draws
+ * two pictures instead of three. */
+static pvtx g_lbuf[65536];
+static const pvtx *stereo_mono(const pvtx *buf, uint32_t n, int shift) {
+    if (!shift || !g_stereo.mono_is_left) return buf;
+    eye_shift(buf, g_lbuf, n, -g_stereo.half_ipd);
+    return g_lbuf;
+}
+
+static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n, int shift) {
     psp_gpu_state st;
     fill_hw_state(&st);
+    const int first = g_stereo.mono_is_left ? 1 : 0;   /* the left eye was the mono draw */
     if (!shift) {                                       /* both eyes see what the mono draw got */
-        for (int eye = 0; eye < 2; eye++) g_hw->draw_eye(eye, &st, g_hwv, g_hwn);
-        g_eye_draws += 2;
+        for (int eye = first; eye < 2; eye++) { g_hw->draw_eye(eye, &st, g_hwv, g_hwn); g_eye_draws++; }
         return;
     }
-    if (p[0] != 0) g_stereo_tan = 1.0f / fabsf(p[0]);
-    for (int eye = 0; eye < 2; eye++) {
-        const float c = eye ? g_stereo.half_ipd : -g_stereo.half_ipd;
-        for (uint32_t i = 0; i < n; i++) {
-            pvtx *o = &g_ebuf[i];
-            *o = buf[i];
-            const float dist = (o->clip[3] - p[15]) / -p[11];
-            const float d = c * (dist / g_stereo.converge - 1.0f);
-            for (int k = 0; k < 4; k++) o->clip[k] += d * p[k];
-            if (o->clip[3] > W_EPS) to_screen(o->clip, &o->s);
-            else o->s.w = 0;
-        }
+    for (int eye = first; eye < 2; eye++) {
+        eye_shift(buf, g_ebuf, n, eye ? g_stereo.half_ipd : -g_stereo.half_ipd);
         g_hwn = 0;
         if (type <= 2) collect_points_lines(type, g_ebuf, n);
         else if (type <= 6) { g_collect = 1; rasterize_rows(type, g_ebuf, n); g_collect = 0; }
