@@ -1230,8 +1230,9 @@ static void sprite_out(const vtx *a, const vtx *b) {
  * Only vertices in front of the camera have screen positions, so the test
  * runs on the triangle after the w clip, never on one that still has a vertex
  * behind the camera (whose screen position is meaningless). */
+static int g_two_sided;                            /* psp_gpu_stereo.two_sided, set around the eyes' 3D draws */
 static int culled_area(float area) {
-    if (!(R[0x1D] & 1)) return 0;
+    if (!(R[0x1D] & 1) || g_two_sided) return 0;
     const int ccw = area < 0;                      /* screen y points down */
     const int front_is_ccw = !(R[0x9B] & 1);
     if (ccw == front_is_ccw) return 0;
@@ -1477,10 +1478,12 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
         if (st && shift == 3) { hw_draw_hud(type, buf, n); return; }   /* ST_PANEL: the HUD picture only */
         /* ST_MOVE seen from the eyes: clipped at near_w (first person). */
         if (st && shift == 1 && g_stereo.eye_views && g_stereo.near_w > W_EPS) g_clip_w = g_stereo.near_w;
+        if (st && shift == 1 && g_stereo.eye_views && g_stereo.two_sided) g_two_sided = 1;
         hw_draw(type, st ? stereo_mono(buf, n, shift) : buf, n);
         hud_scissor_restore();
         if (st && g_hw_ok) hw_draw_eyes(type, buf, n, shift);
         g_clip_w = W_EPS;
+        g_two_sided = 0;
         return;
     }
     /* PSP2I_GPU_VERIFY=N checks every Nth primitive (1 = all of them). */

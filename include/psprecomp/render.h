@@ -179,6 +179,11 @@ typedef struct psp_gpu_stereo {
      * in front of the eye; 0 = as before. The host's first person hides the
      * player's own head with it. */
     float near_w;
+    /* eye_views: the 3D scene's draws keep their back faces (no back-face
+     * culling). The game's art is one-sided where its camera never looks
+     * from behind, so the eyes, looking from other angles, saw through
+     * walls and roofs. */
+    int   two_sided;
 } psp_gpu_stereo;
 void psp_gpu_set_stereo(const psp_gpu_stereo *s);
 /* The horizontal half-FOV tangent (1/PROJ[0]) of the last perspective draw
