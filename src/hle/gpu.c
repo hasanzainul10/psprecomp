@@ -2169,13 +2169,17 @@ enum { ST_SAME, ST_MOVE, ST_HUD, ST_PANEL, ST_FX, ST_DROP };
  * to the player's face, moving with them ("a transparent rectangle
  * overhead", 2026-10-23 GE dumps): with eye views such draws are dropped. */
 static int st_screen_extruded(const pvtx *b, uint32_t n) {
-    int has_near = 0, has_far = 0;
-    for (uint32_t i = 0; i < n && !(has_near && has_far); i++) {
+    /* Untextured, with a vertex at clip z -1 exactly and a small w: the
+     * game's light-shaft and haze fans (first person: the outer vertices at
+     * w 1; third person and the dark missions' variant: every vertex at z -1,
+     * w 1..10, GE dumps 2026-10-23). The scene's own geometry has z about -2
+     * at any usual distance under this projection (row z: -0.0001, -2). */
+    if (R[0x1E] & 1) return 0;                          /* textured: real geometry */
+    for (uint32_t i = 0; i < n; i++) {
         const float w = b[i].clip[3], z = b[i].clip[2];
-        if (fabsf(w - 1.0f) < 1e-4f && fabsf(z + w) < 1e-3f) has_near = 1;
-        else if (w > 4.0f) has_far = 1;
+        if (fabsf(z + 1.0f) < 1e-3f && w > 0.5f && w < 30.0f) return 1;
     }
-    return has_near && has_far;
+    return 0;
 }
 
 /* Near full-screen (bloom and copy passes): at least 45% of the screen, or
