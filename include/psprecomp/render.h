@@ -265,4 +265,15 @@ typedef struct {
 } psp_gpu_draw_info;
 void psp_gpu_set_draw_observer(void (*fn)(const psp_gpu_draw_info *));
 
+/* While on, a skinned draw with an all-zero bone matrix (no real bone is) is
+ * not drawn: a host marks the bones a mesh must disappear with this way, so
+ * a mesh blended between them and others goes whole instead of squashing
+ * (a VR first person's own face). Off by default. */
+void psp_gpu_set_skin_zero_drop(int on);
+
+/* While on, an unskinned 3D draw whose world origin (WORLD's translation, eye
+ * space) is within r of c is not drawn: a host removes a rigid mesh it can
+ * only locate, not hook (a VR first person's own head). Off by default. */
+void psp_gpu_set_rigid_drop(int on, const float c[3], float r);
+
 #endif

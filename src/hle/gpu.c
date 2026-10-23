@@ -1167,6 +1167,14 @@ static void lerp_clip(const pvtx *a, const pvtx *b, float t, pvtx *o) {
 static const psp_gpu_backend *g_hw;
 static void (*g_observer)(const psp_gpu_draw_info *);
 void psp_gpu_set_draw_observer(void (*fn)(const psp_gpu_draw_info *)) { g_observer = fn; }
+static int g_skin_zero_drop;
+void psp_gpu_set_skin_zero_drop(int on) { g_skin_zero_drop = on; }
+static int   g_rigid_drop;
+static float g_rigid_c[3], g_rigid_r2;
+void psp_gpu_set_rigid_drop(int on, const float c[3], float r) {
+    g_rigid_drop = on;
+    if (on) { g_rigid_c[0] = c[0]; g_rigid_c[1] = c[1]; g_rigid_c[2] = c[2]; g_rigid_r2 = r * r; }
+}
 void psp_gpu_set_backend(const psp_gpu_backend *be) { g_hw = be; }
 const psp_gpu_backend *psp_gpu_get_backend(void) { return g_hw; }
 
@@ -1367,6 +1375,17 @@ static void dump_draw(uint32_t type, uint32_t n, const pvtx *buf) {
                     ge_float(R[0x45]), ge_float(R[0x46]), ge_float(R[0x47]),
                     (R[0x4C] & 0xFFFF) / 16.0, (R[0x4D] & 0xFFFF) / 16.0);
         }
+        /* A skinned draw's bones (their translations, eye space: the camera
+         * is in them): which skeleton nodes a mesh hangs on. */
+        else if (!VT_WEIGHT(vt)) {                     /* a rigid draw: where it is placed */
+            fprintf(out, "    world  t %.3f %.3f %.3f\n", g_world[9], g_world[10], g_world[11]);
+        }
+        if (VT_WEIGHT(vt)) {
+            fprintf(out, "    bones");
+            for (int k = 0; k < (int)VT_NWEIGHT(vt); k++)
+                fprintf(out, " %d (%.2f %.2f %.2f)", k, g_bone[k * 12 + 9], g_bone[k * 12 + 10], g_bone[k * 12 + 11]);
+            fputc('\n', out);
+        }
     }
 }
 
@@ -1398,6 +1417,17 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
     layout L;
     make_layout(vt, &L);
     if (L.p_off < 0 || !L.stride || !count) return;
+    if (g_skin_zero_drop && !VT_THROUGH(vt) && L.w_off >= 0) {     /* a marked bone: the draw goes whole */
+        for (int k = 0; k < (int)VT_NWEIGHT(vt); k++) {
+            int zero = 1;
+            for (int j = 0; j < 12 && zero; j++) zero = g_bone[k * 12 + j] == 0.0f;
+            if (zero) return;
+        }
+    }
+    if (g_rigid_drop && !VT_THROUGH(vt) && L.w_off < 0) {             /* a rigid mesh at the marked place */
+        const float dx = g_world[9] - g_rigid_c[0], dy = g_world[10] - g_rigid_c[1], dz = g_world[11] - g_rigid_c[2];
+        if (dx * dx + dy * dy + dz * dz < g_rigid_r2) return;
+    }
     g_through = (int)VT_THROUGH(vt);
     g_prims++;
     if (g_null_backend()) return;
