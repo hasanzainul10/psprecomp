@@ -1992,6 +1992,7 @@ float psp_gpu_stereo_tan_half_fov(void) { return g_stereo_tan; }
  * rest of the frame is drawn flat. The frame is the draws between flips. */
 static uint64_t g_st_flip = (uint64_t)-1;
 static uint32_t g_st_3d_fb;                /* the target of this frame's perspective draws, 0 = none */
+static uint32_t g_st_scene_fb;             /* eye_views: the target of the frame's first moved draw (its scene) */
 static int      g_st_flat;
 /* eye_views: this frame's eye matrices and tag (latched at its first moved
  * draw), and each eye's clip-space matrix for the current PROJ. */
@@ -2134,9 +2135,15 @@ static int stereo_kmat(void) {
     return 1;
 }
 
-/* At the latch: the scene's projection, for ST_FX (screen-space effects are
- * placed through it): S * PROJ * eye_view per eye, and its unprojection. */
+/* At the latch, and again at each moved draw with another PROJ: the
+ * scene's projection, for ST_FX (screen-space effects are placed through
+ * it): S * PROJ * eye_view per eye, and its unprojection. The latest moved
+ * draw's, as the effects that follow are projected with it: the frame's
+ * first moved draw (the sky) can have another depth row than the models'
+ * (2026-10-23 GE dump: z row -0.0067, -201 at the latch, ~-0.001, -14 for
+ * the enemy), and the effects' depth is read through it (fx_vertex). */
 static void stereo_fx_latch(void) {
+    if (g_st_sproj_ok && !memcmp(g_st_sproj, g_proj, sizeof g_st_sproj)) return;
     memcpy(g_st_sproj, g_proj, sizeof g_st_sproj);
     g_st_sproj_ok = unproj3(g_proj, g_st_sunproj);
     for (int e = 0; e < 2; e++) { mat4_mul(g_proj, g_st_view[e], g_st_kfx[e]); widen(g_st_kfx[e]); }
@@ -2219,7 +2226,9 @@ static int stereo_classify(const pvtx *buf, uint32_t n) {
         g_st_tag = s.flat_frame ? 0 : s.tag;
         g_st_flat_frame = s.flat_frame;
         g_st_latched = 1;
+        g_st_scene_fb = g_fb;
         g_st_kvalid = 0;
+        g_st_sproj_ok = 0;
         stereo_fx_latch();
         if (g_st_trace && g_st_trace_on) {
             fprintf(g_st_trace, "latched: tag %u%s, fov scale %.2f / %.2f\n", g_st_tag,
@@ -2232,7 +2241,12 @@ static int stereo_classify(const pvtx *buf, uint32_t n) {
     }
     if (!g_stereo.eye_views) return persp && !g_st_flat ? ST_MOVE : ST_SAME;
     if (g_st_latched && g_st_flat_frame) return ST_SAME;
-    if (persp && !g_st_flat) return st_screen_extruded(buf, n) ? ST_DROP : ST_MOVE;
+    if (persp && !g_st_flat) {
+        if (st_screen_extruded(buf, n)) return ST_DROP;
+        if (g_stereo.no_glow && g_st_latched && g_fb != g_st_scene_fb) return ST_DROP;   /* a glow buffer's */
+        if (g_st_latched) stereo_fx_latch();          /* the projection the next effects use */
+        return ST_MOVE;
+    }
     if (!g_st_latched || !g_st_3d_fb || g_fb != g_st_3d_fb || g_clear || !n || n > 65536) return ST_SAME;
     if (g_st_flat) {                                   /* the HUD pass on the 3D target */
         float frac = 0;
@@ -2241,7 +2255,14 @@ static int stereo_classify(const pvtx *buf, uint32_t n) {
             st_bbox(buf, n, r);
             if (r[2] > r[0] && r[3] > r[1]) frac = (r[2] - r[0]) * (r[3] - r[1]) / (480.0f * 272.0f);
         }
-        const int panel_layer = !persp || (g_stereo.hud_panel && g_stereo.hud_panel(buf[0].clip[3], frac));
+        /* Clipped to a window smaller than the screen: the minimap's 3D map
+         * (scissor 403,6-473,76, the only such window in 58 GE dumps). Its
+         * clip w follows the area's map, from below 0 up past 2300, so by
+         * w alone some of it (87-883 in the Ruins, VR capture 2026-10-23)
+         * was taken for world labels and moved per eye: "the map seems
+         * buggy". */
+        const int windowed = g_sx0 > 0 || g_sy0 > 0 || g_sx1 < 479 || g_sy1 < 271;
+        const int panel_layer = !persp || windowed || (g_stereo.hud_panel && g_stereo.hud_panel(buf[0].clip[3], frac));
         if (!panel_layer) return ST_HUD;
         return g_hw && g_hw->draw_hud ? ST_PANEL : ST_SAME;
     }
@@ -2265,12 +2286,25 @@ static void hud_vertex(const float *in, float *out, int eye) {
 }
 
 /* A screen-space effect vertex (orthographic: its x, y are the screen
- * position) for eye `eye`: the point at fx_dist along the scene camera's ray
- * through that position, through the eye. The depth value stays the game's. */
+ * position) for eye `eye`: the point along the scene camera's ray through
+ * that position at the effect's own depth, through the eye. PSP2i gives its
+ * effect sprites the depth value of what they sit on (an enemy's glow: z
+ * 41223 against its body's 41264, GE dump 2026-10-23), so read through the
+ * scene's depth row that is the distance (clip w) of the body; at a fixed
+ * fx_dist the glow floated apart from the enemy ("the glow from enemy
+ * somehow become separate from body"). fx_dist when the depth gives no sane
+ * distance. The depth value stays the game's. */
 static void fx_vertex(const float *in, float *out, int eye) {
     const float *m = g_st_sunproj, *P = g_st_sproj;
     const float iw = fabsf(in[3]) > W_EPS ? 1.0f / in[3] : 1.0f;
-    const float d = g_stereo.fx_dist > 0 ? g_stereo.fx_dist : 50.0f;
+    float d = g_stereo.fx_dist > 0 ? g_stereo.fx_dist : 50.0f;
+    {   /* z / w = (P10 vz + P14) / (P11 vz + P15), for view z vz */
+        const float nz = in[2] * iw, den = nz * P[11] - P[10];
+        if (fabsf(den) > 1e-9f) {
+            const float vz = (P[14] - nz * P[15]) / den, dw = P[11] * vz + P[15];
+            if (dw > 0.5f && dw < 1e5f) d = dw;
+        }
+    }
     const float rx = in[0] * iw * d - P[12], ry = in[1] * iw * d - P[13], rw = d - P[15];
     const float x = m[0] * rx + m[1] * ry + m[2] * rw;
     const float y = m[3] * rx + m[4] * ry + m[5] * rw;

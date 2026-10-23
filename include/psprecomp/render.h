@@ -184,6 +184,10 @@ typedef struct psp_gpu_stereo {
      * from behind, so the eyes, looking from other angles, saw through
      * walls and roofs. */
     int   two_sided;
+    /* eye_views: a frame's 3D draws into another target than its scene's
+     * (PSP2i's glow buffer, blurred and added over the scene) are dropped,
+     * so nothing glows. */
+    int   no_glow;
 } psp_gpu_stereo;
 void psp_gpu_set_stereo(const psp_gpu_stereo *s);
 /* The horizontal half-FOV tangent (1/PROJ[0]) of the last perspective draw
