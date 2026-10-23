@@ -1383,6 +1383,7 @@ static void st_trace_flip(void);
 static void st_trace_draw(uint32_t type, const pvtx *buf, uint32_t n, int shift);
 static void st_probe_draw(const pvtx *buf, uint32_t n);
 static int  g_st_probe_on;                 /* psp_gpu_stereo_probe: 1 armed, 2 measuring */
+static uint64_t g_st_dropped;              /* ST_DROP draws (st_screen_extruded) */
 static void hud_scissor_restore(void);
 static FILE *g_st_trace;                 /* psp_gpu_stereo_trace (below) */
 static int   g_st_trace_on;
@@ -1476,6 +1477,7 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
         if (st && g_st_trace && g_st_trace_on) st_trace_draw(type, buf, n, shift);
         if (st && g_st_probe_on && shift == 1) st_probe_draw(buf, n);  /* ST_MOVE: the 3D scene */
         if (st && shift == 3) { hw_draw_hud(type, buf, n); return; }   /* ST_PANEL: the HUD picture only */
+        if (st && shift == 5) { g_st_dropped++; return; }              /* ST_DROP: not drawn */
         /* ST_MOVE seen from the eyes: clipped at near_w (first person). */
         if (st && shift == 1 && g_stereo.eye_views && g_stereo.near_w > W_EPS) g_clip_w = g_stereo.near_w;
         if (st && shift == 1 && g_stereo.eye_views && g_stereo.two_sided) g_two_sided = 1;
@@ -2158,7 +2160,23 @@ static void stereo_fx_latch(void) {
  *             placed in the world through the scene's projection
  * Also keeps the frame's HUD-pass state (flat_after_clear) and, with
  * eye_views, latches the frame's eye matrices at its first moved draw. */
-enum { ST_SAME, ST_MOVE, ST_HUD, ST_PANEL, ST_FX };
+enum { ST_SAME, ST_MOVE, ST_HUD, ST_PANEL, ST_FX, ST_DROP };
+
+/* A 3D draw with vertices the game built in screen space on the near plane
+ * (clip w 1, z -w: its light-shaft fans, from a light out to the screen's
+ * edges) next to real 3D ones. Seen from the eyes those vertices are a point
+ * just in front of the game camera, so the fan became a sheet from the light
+ * to the player's face, moving with them ("a transparent rectangle
+ * overhead", 2026-10-23 GE dumps): with eye views such draws are dropped. */
+static int st_screen_extruded(const pvtx *b, uint32_t n) {
+    int has_near = 0, has_far = 0;
+    for (uint32_t i = 0; i < n && !(has_near && has_far); i++) {
+        const float w = b[i].clip[3], z = b[i].clip[2];
+        if (fabsf(w - 1.0f) < 1e-4f && fabsf(z + w) < 1e-3f) has_near = 1;
+        else if (w > 4.0f) has_far = 1;
+    }
+    return has_near && has_far;
+}
 
 /* Near full-screen (bloom and copy passes): at least 45% of the screen, or
  * nearly its whole width and height. */
@@ -2210,7 +2228,7 @@ static int stereo_classify(const pvtx *buf, uint32_t n) {
     }
     if (!g_stereo.eye_views) return persp && !g_st_flat ? ST_MOVE : ST_SAME;
     if (g_st_latched && g_st_flat_frame) return ST_SAME;
-    if (persp && !g_st_flat) return ST_MOVE;
+    if (persp && !g_st_flat) return st_screen_extruded(buf, n) ? ST_DROP : ST_MOVE;
     if (!g_st_latched || !g_st_3d_fb || g_fb != g_st_3d_fb || g_clear || !n || n > 65536) return ST_SAME;
     if (g_st_flat) {                                   /* the HUD pass on the 3D target */
         float frac = 0;
@@ -2378,7 +2396,7 @@ static void st_probe_draw(const pvtx *buf, uint32_t n) {
  * counted). For the left eye: its screen box before and after, and the
  * scissor before and after. */
 static void st_trace_draw(uint32_t type, const pvtx *buf, uint32_t n, int shift) {
-    static const char *const KIND[] = { "same", "move", "world", "panel", "fx" };
+    static const char *const KIND[] = { "same", "move", "world", "panel", "fx", "drop" };
     g_st_trace_n++;
     if (shift == ST_MOVE) { g_st_trace_moved++; return; }
     float before[4], after[4];
@@ -2396,7 +2414,7 @@ static void st_trace_draw(uint32_t type, const pvtx *buf, uint32_t n, int shift)
     }
     fprintf(g_st_trace, "  #%-4u %-6s prim %u x%-5u fb 0x%06X%s%s w %8.2f box %6.1f,%6.1f-%6.1f,%6.1f -> %7.1f,%7.1f-%7.1f,%7.1f"
             " scissor %d,%d-%d,%d -> %d,%d-%d,%d\n",
-            g_st_trace_n, KIND[shift < 5 ? shift : 0], type, n, g_fb, g_through ? " through" : "", g_st_flat ? " hudpass" : "",
+            g_st_trace_n, KIND[shift < 6 ? shift : 0], type, n, g_fb, g_through ? " through" : "", g_st_flat ? " hudpass" : "",
             n ? (double)buf[0].clip[3] : 0.0,
             (double)before[0], (double)before[1], (double)before[2], (double)before[3],
             (double)after[0], (double)after[1], (double)after[2], (double)after[3],
@@ -2586,6 +2604,9 @@ void psp_gpu_dump_stats(FILE *out) {
         fprintf(out, "    stereo: HUD pass %llu draws on the panel, %llu labels in the world (%llu scissors moved); %llu effects placed in the world\n",
                 (unsigned long long)g_st_panel_draws, (unsigned long long)g_st_hud_draws, (unsigned long long)g_st_sc_moved,
                 (unsigned long long)g_st_fx_draws);
+    if (g_st_dropped)
+        fprintf(out, "    stereo: %llu draws dropped (screen-space fans on the near plane: the light shafts)\n",
+                (unsigned long long)g_st_dropped);
     fprintf(out, "    render threads %d; draws split across them %llu, drawn on one %llu\n",
             g_nworkers, (unsigned long long)g_parallel_draws, (unsigned long long)g_serial_draws);
     fprintf(out, "    draws %llu (%llu textured), %llu triangles culled, %llu clipped\n",
