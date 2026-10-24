@@ -1175,6 +1175,16 @@ void psp_gpu_set_rigid_drop(int on, const float c[3], float r) {
     g_rigid_drop = on;
     if (on) { g_rigid_c[0] = c[0]; g_rigid_c[1] = c[1]; g_rigid_c[2] = c[2]; g_rigid_r2 = r * r; }
 }
+static int   g_rigid_move;
+static float g_rigid_mc[3], g_rigid_mr2, g_rigid_mm[16];
+void psp_gpu_set_rigid_move(int on, const float c[3], float r, const float m[16]) {
+    g_rigid_move = on;
+    if (on) {
+        for (int k = 0; k < 3; k++) g_rigid_mc[k] = c[k];
+        for (int k = 0; k < 16; k++) g_rigid_mm[k] = m[k];
+        g_rigid_mr2 = r * r;
+    }
+}
 void psp_gpu_set_backend(const psp_gpu_backend *be) { g_hw = be; }
 const psp_gpu_backend *psp_gpu_get_backend(void) { return g_hw; }
 
@@ -1412,7 +1422,33 @@ static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n, int shift);
 static psp_gpu_stereo g_stereo;
 static int g_hw_ok;                       /* the last hw_draw went to the backend (not software) */
 
+static void gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr);
+/* A rigid mesh at the marked place drawn moved (psp_gpu_set_rigid_move):
+ * WORLD = m x WORLD for this draw only, with the same test as the drop. */
 void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr) {
+    const uint32_t vt = R[0x12];
+    if (g_rigid_move && !VT_THROUGH(vt) && fabsf(g_proj[11]) > 1e-6f &&
+        g_world[9] * g_world[9] + g_world[10] * g_world[10] + g_world[11] * g_world[11] > 0.25f) {
+        layout L;
+        make_layout(vt, &L);
+        const float dx = g_world[9] - g_rigid_mc[0], dy = g_world[10] - g_rigid_mc[1], dz = g_world[11] - g_rigid_mc[2];
+        if (L.w_off < 0 && dx * dx + dy * dy + dz * dz < g_rigid_mr2) {
+            float keep[12];
+            const float *m = g_rigid_mm;
+            memcpy(keep, g_world, sizeof keep);
+            for (int c = 0; c < 4; c++)                         /* WORLD: 4 columns of 3 */
+                for (int r = 0; r < 3; r++)
+                    g_world[c * 3 + r] = m[r] * keep[c * 3] + m[4 + r] * keep[c * 3 + 1] + m[8 + r] * keep[c * 3 + 2] +
+                                         (c == 3 ? m[12 + r] : 0.0f);
+            gpu_prim(type, count, vaddr, iaddr);
+            memcpy(g_world, keep, sizeof keep);
+            return;
+        }
+    }
+    gpu_prim(type, count, vaddr, iaddr);
+}
+
+static void gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr) {
     const uint32_t vt = R[0x12];
     layout L;
     make_layout(vt, &L);

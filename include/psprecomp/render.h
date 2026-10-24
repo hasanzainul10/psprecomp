@@ -276,4 +276,10 @@ void psp_gpu_set_skin_zero_drop(int on);
  * only locate, not hook (a VR first person's own head). Off by default. */
 void psp_gpu_set_rigid_drop(int on, const float c[3], float r);
 
+/* While on, an unskinned 3D draw whose world origin is within r of c (eye
+ * space, as above) is drawn with WORLD = m x WORLD (m: 4x4, columns): a host
+ * moves a rigid mesh it can only locate (a VR body's head, placed by the game
+ * from a pose the host redraws). Off by default. */
+void psp_gpu_set_rigid_move(int on, const float c[3], float r, const float m[16]);
+
 #endif
