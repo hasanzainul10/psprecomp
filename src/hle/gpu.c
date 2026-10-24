@@ -1424,7 +1424,14 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
             if (zero) return;
         }
     }
-    if (g_rigid_drop && !VT_THROUGH(vt) && L.w_off < 0) {             /* a rigid mesh at the marked place */
+    /* A rigid mesh at the marked place: perspective only, and not one placed
+     * at the camera itself. In a VR first person the mark (the head) is ~2.3
+     * from the camera, so screen-space effects (orthographic, origin 0,0,0)
+     * and the sky (centred on the camera) fell inside it too and were
+     * dropped: flat blips during attacks (user; gone with the head hiding
+     * off, 2026-10-24). */
+    if (g_rigid_drop && !VT_THROUGH(vt) && L.w_off < 0 && fabsf(g_proj[11]) > 1e-6f &&
+        g_world[9] * g_world[9] + g_world[10] * g_world[10] + g_world[11] * g_world[11] > 0.25f) {
         const float dx = g_world[9] - g_rigid_c[0], dy = g_world[10] - g_rigid_c[1], dz = g_world[11] - g_rigid_c[2];
         if (dx * dx + dy * dy + dz * dz < g_rigid_r2) return;
     }
@@ -2021,6 +2028,7 @@ float psp_gpu_stereo_tan_half_fov(void) { return g_stereo_tan; }
  * frame. So once a target that took perspective draws is cleared again, the
  * rest of the frame is drawn flat. The frame is the draws between flips. */
 static uint64_t g_st_flip = (uint64_t)-1;
+
 static uint32_t g_st_3d_fb;                /* the target of this frame's perspective draws, 0 = none */
 static uint32_t g_st_scene_fb;             /* eye_views: the target of the frame's first moved draw (its scene) */
 static int      g_st_flat;
@@ -2230,19 +2238,110 @@ static int st_fullscreen(const pvtx *buf, uint32_t n) {
         if (buf[i].s.y > y1) y1 = buf[i].s.y;
     }
     const float w = x1 - x0, h = y1 - y0;
+    /* From the screen's corner: the bloom and copy passes start at 0,0. A
+     * big attack flash (290 x 260 from 200,177, past the bottom edge: VR
+     * capture 2026-10-24) is an effect, placed in the world: taken for a
+     * pass, it was drawn flat in both eyes, fixed to the view (user: "it
+     * blips to flat during attacks"). */
+    if (x0 > 4.0f || y0 > 4.0f) return 0;
     return w * h >= 0.45f * 480.0f * 272.0f || (w >= 0.9f * 480.0f && h >= 0.85f * 272.0f);
 }
 
 static void st_bbox(const pvtx *b, uint32_t n, float *r);
 
+/* A frame whose 3D target got many draws the same in both eyes (a normal
+ * one: ~11, its clears): its HUD went into the eye pictures, fixed to the
+ * view (user: "the HUD sometimes becomes eye-tied, when moving"). Counted per
+ * flip by why, and reported on the next flip. */
+static unsigned g_sm_n, g_sm_flatframe, g_sm_unlatched, g_sm_otherfb, g_sm_clear, g_sm_hud;
+static unsigned g_hm_move, g_hm_label;               /* field-HUD-depth sheets put in the world, per flip */
+static unsigned g_hm_clr3d, g_hm_clr3d_latched, g_hm_clr_other, g_hm_moves;
+static int      g_hm_first_is_hud = -1;                /* the flip's first moved draw was a HUD sheet */
+static unsigned g_hp_scene_panel, g_hp_start_moves, g_hp_which, g_hp_after;   /* 3D geometry put on the panel */
+static void stereo_same_report(uint64_t flip) {
+    if (g_sm_n > 30 && g_stereo.eye_views)
+        fprintf(stderr, "stereo: flip %llu: %u draws on the 3D target the same in both eyes (flat frame %u, before the"
+                        " latch %u, another target %u, clears %u, HUD pass %u)\n", (unsigned long long)flip, g_sm_n,
+                g_sm_flatframe, g_sm_unlatched, g_sm_otherfb, g_sm_clear, g_sm_hud);
+    if (g_hm_move + g_hm_label > 5 && g_stereo.eye_views)
+        fprintf(stderr, "stereo: flip %llu: %u sheets at the field HUD's depth (w 84-86) put in the world: %u as the 3D scene"
+                        " (no HUD pass seen), %u as labels; clears on the 3D target %u (%u after the latch), on others %u;"
+                        " %u moved draws, the first %s\n", (unsigned long long)flip, g_hm_move + g_hm_label, g_hm_move,
+                g_hm_label, g_hm_clr3d, g_hm_clr3d_latched, g_hm_clr_other, g_hm_moves,
+                g_hm_first_is_hud > 0 ? "a HUD sheet" : g_hm_first_is_hud == 0 ? "scene" : "none");
+    g_sm_n = g_sm_flatframe = g_sm_unlatched = g_sm_otherfb = g_sm_clear = g_sm_hud = 0;
+    g_hm_move = g_hm_label = 0;
+    if (g_hp_scene_panel > 20 && g_stereo.eye_views)
+        fprintf(stderr, "stereo: flip %llu: %u 3D draws (not flat sheets) on the HUD panel: the HUD pass began after %u moved"
+                        " draws at a clear of bits %u; %u HUD-pass draws after it\n", (unsigned long long)flip,
+                g_hp_scene_panel, g_hp_start_moves, g_hp_which, g_hp_after);
+    g_hm_clr3d = g_hm_clr3d_latched = g_hm_clr_other = g_hm_moves = 0;
+    g_hm_first_is_hud = -1;
+    g_hp_scene_panel = g_hp_start_moves = g_hp_which = g_hp_after = 0;
+}
+
+static int stereo_classify_(const pvtx *buf, uint32_t n);
 static int stereo_classify(const pvtx *buf, uint32_t n) {
+    const uint64_t flip = psp_display_flips();
+    if (flip != g_st_flip) stereo_same_report(g_st_flip);
+    if (g_clear) {                                       /* before classifying: where this frame's clears go */
+        if (g_st_3d_fb && g_fb == g_st_3d_fb) { g_hm_clr3d++; if (g_st_latched) g_hm_clr3d_latched++; }
+        else g_hm_clr_other++;
+    }
+    const int k = stereo_classify_(buf, n);
+    if (k == ST_SAME && g_st_3d_fb && g_fb == g_st_3d_fb && !g_through) {
+        g_sm_n++;
+        if (g_st_latched && g_st_flat_frame) g_sm_flatframe++;
+        else if (!g_st_latched) g_sm_unlatched++;
+        else if (g_clear) g_sm_clear++;
+        else if (g_st_flat) g_sm_hud++;
+    } else if (k == ST_SAME && g_st_3d_fb && g_fb != g_st_3d_fb) g_sm_otherfb++;
+    int hud_sheet = 0;
+    if ((k == ST_MOVE || k == ST_HUD) && n && buf[0].clip[3] >= 84.0f && buf[0].clip[3] < 86.0f) {
+        int flat = 1;                                    /* a sheet: every vertex at the same depth */
+        for (uint32_t i = 1; i < n && flat; i++) flat = fabsf(buf[i].clip[3] - buf[0].clip[3]) < 0.01f;
+        if (flat) { hud_sheet = 1; if (k == ST_MOVE) g_hm_move++; else g_hm_label++; }
+    }
+    if ((k == ST_PANEL || k == ST_HUD) && n > 2) {
+        g_hp_after++;
+        int flat = 1;
+        for (uint32_t i = 1; i < n && flat; i++) flat = fabsf(buf[i].clip[3] - buf[0].clip[3]) < 0.01f;
+        if (!flat) g_hp_scene_panel++;
+    }
+    if (k == ST_MOVE) {
+        g_hm_moves++;
+        if (g_hm_first_is_hud < 0) g_hm_first_is_hud = hud_sheet;
+    }
+    return k;
+}
+
+static int stereo_classify_(const pvtx *buf, uint32_t n) {
     const float *p = g_proj;
     const uint64_t flip = psp_display_flips();
     if (flip != g_st_flip) { g_st_flip = flip; g_st_3d_fb = 0; g_st_flat = 0; g_st_latched = 0; }
-    if (g_clear && g_st_3d_fb && g_fb == g_st_3d_fb && g_stereo.flat_after_clear) g_st_flat = 1;
+    /* The HUD pass begins at a clear of the 3D target that includes depth
+     * (PSP2i's second, depth clear). An attack's effect clears colour and
+     * alpha of the same target mid-scene (bits 3, after 42 moved draws): taken
+     * for the HUD pass, the rest of the scene went flat onto the HUD panel
+     * (user: "it blips to flat during attacks"; once the glow buffer no
+     * longer took the 3D target, 2026-10-24). */
+    if (g_clear && g_st_3d_fb && g_fb == g_st_3d_fb && g_stereo.flat_after_clear && !g_st_flat) {
+        const uint32_t which = (R[0xD3] >> 8) & 7;
+        if (which & 4) {
+            g_st_flat = 1;
+            g_hp_start_moves = g_hm_moves;               /* dev report: where the HUD pass began */
+            g_hp_which = which;
+        }
+    }
     /* Perspective: w grows with distance. */
     const int persp = !g_through && fabsf(p[11]) > 1e-6f && (g_stereo.converge > 0 || g_stereo.eye_views) && n <= 65536;
-    if (persp && !g_st_flat) g_st_3d_fb = g_fb;
+    /* The 3D target: the scene's. Once latched, 3D draws into another target
+     * (the glow buffer 0x154000, after the scene) don't take it over: they
+     * did, so the HUD pass's clear of the scene's target went unseen and the
+     * whole HUD was moved as 3D scene, fixed to the head in first person
+     * (user: "the HUD sometimes becomes eye-tied when moving"; 287 of 318
+     * such frames had their clears all on "another" target, 2026-10-24). */
+    if (persp && !g_st_flat && (!g_st_latched || g_fb == g_st_scene_fb)) g_st_3d_fb = g_fb;
     if (persp && !g_st_flat && p[0] != 0) g_stereo_tan = 1.0f / fabsf(p[0]);
     if (persp && !g_st_flat && g_stereo.eye_views && !g_st_latched) {
         psp_gpu_stereo s = g_stereo;
@@ -2296,6 +2395,14 @@ static int stereo_classify(const pvtx *buf, uint32_t n) {
         if (!panel_layer) return ST_HUD;
         return g_hw && g_hw->draw_hud ? ST_PANEL : ST_SAME;
     }
+    /* No glow: the glow chain's last step, a full-screen draw onto the 3D
+     * target textured from VRAM (its blur at 0x04000000, in the display
+     * buffer's corner), is dropped too: its 3D draws already are, so it only
+     * added whatever that corner held (GE dump 2026-10-24). Not the cause of
+     * the eye-tied HUD (that was the glow buffer taking the 3D target, above),
+     * but nothing of the glow is drawn with it off. */
+    if (g_stereo.no_glow && (R[0x1E] & 1) && (tex_addr(0) & 0x0F000000u) == 0x04000000u && st_fullscreen(buf, n))
+        return ST_DROP;
     if (!g_through && g_st_sproj_ok && !st_fullscreen(buf, n)) return ST_FX;   /* the scene pass: effects */
     return ST_SAME;
 }
