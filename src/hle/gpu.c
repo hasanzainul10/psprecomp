@@ -2116,18 +2116,47 @@ static uint64_t hash_bytes(uint64_t h, const uint8_t *p, size_t n) {
     return h;
 }
 
-uint64_t psp_gpu_texture_hash(void) {
+/* A change detector for texture bytes, not stored anywhere: four 32-bit
+ * lanes over 16 bytes a step. The 64-bit hash_bytes costs a 64-bit multiply
+ * per 8 bytes, slow on 32-bit CPUs: the 3DS port hashed ~0.8 M texels a
+ * frame in town (3DS_PROGRESS.md, T4). */
+static uint32_t rotl32(uint32_t x, int r);
+static uint64_t hash_lanes(const uint8_t *p, size_t n) {
+    uint32_t a = 0x9E3779B1u, b = 0x85EBCA77u, c = 0xC2B2AE3Du, d = 0x27D4EB2Fu;
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        uint32_t w[4];
+        memcpy(w, p + i, 16);
+        a = rotl32(a ^ w[0], 13) * 0x9E3779B1u;
+        b = rotl32(b ^ w[1], 13) * 0x9E3779B1u;
+        c = rotl32(c ^ w[2], 13) * 0x9E3779B1u;
+        d = rotl32(d ^ w[3], 13) * 0x9E3779B1u;
+    }
+    for (; i < n; i++) a = rotl32(a ^ p[i], 5) * 0x85EBCA77u;
+    const uint32_t lo = rotl32(a, 1) + rotl32(b, 7) + rotl32(c, 12) + rotl32(d, 18);
+    const uint32_t hi = (a ^ c) * 0xC2B2AE3Du + (b ^ d) + (uint32_t)n;
+    return ((uint64_t)hi << 32) | lo;
+}
+
+uint64_t psp_gpu_texture_data_hash(void) {
     static const int bpp_of[11] = { 16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8 };
     const int psm = (int)(R[0xC3] & 0xF);
     const uint32_t w = tex_w(0), h = tex_h(0), bufw = tex_bufw(0);
     uint32_t bytes;
     if (psm >= 8) bytes = (bufw / 4 ? bufw / 4 : 1) * (h / 4 ? h / 4 : 1) * (psm == 8 ? 8u : 16u);
     else bytes = tex_extent(w, h, bufw ? bufw : 1, bpp_of[psm > 10 ? 3 : psm], (int)(R[0xC2] & 1));
-    uint64_t hsh = 0xCBF29CE484222325ull;
     const uint8_t *p = mem(tex_addr(0), bytes);
-    if (p) hsh = hash_bytes(hsh, p, bytes);
-    if (psm >= 4 && psm <= 7) hsh = hash_bytes(hsh, g_clut, sizeof g_clut) ^ R[0xC5];
-    return hsh;
+    return p ? hash_lanes(p, bytes) : 0;
+}
+
+uint64_t psp_gpu_clut_hash(void) {
+    const int psm = (int)(R[0xC3] & 0xF);
+    if (psm < 4 || psm > 7) return 0;
+    return hash_lanes(g_clut, sizeof g_clut) ^ R[0xC5];
+}
+
+uint64_t psp_gpu_texture_hash(void) {
+    return psp_gpu_texture_data_hash() * 0x9E3779B97F4A7C15ull ^ psp_gpu_clut_hash();
 }
 
 /* ---- PPSSPP texture-pack keys ---------------------------------------------------------

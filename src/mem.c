@@ -221,10 +221,28 @@ void psp_write16(uint32_t addr, uint16_t val) { WRITE_BODY(uint16_t) }
 void psp_write32(uint32_t addr, uint32_t val) { WRITE_BODY(uint32_t) }
 void psp_write_f32(uint32_t addr, float  val) { WRITE_BODY(float)    }
 
+/* Block writes, and the ones that look like loading: 96 KB or more, or 4 KB
+ * or more into memory none of the last 8 touched. A stream refilling one buffer doesn't
+ * count: in PSP2i's town a 270 MB file is read ~5 times a second, 57-70 KB
+ * at a time into the same ~80 KB at 0x09AC8000, while loading an area reads
+ * hundreds of KB to new places (3DS_PROGRESS.md, T4). */
+static uint32_t g_block_writes, g_load_writes;
+static uint32_t g_recent_a[8], g_recent_e[8];
+static int g_recent_n;
+uint32_t psp_mem_block_writes(void) { return g_block_writes; }
+uint32_t psp_mem_load_writes(void) { return g_load_writes; }
+
 int psp_mem_write_block(uint32_t addr, const void *src, uint32_t len) {
     void *p = psp_mem_ptr(addr, len);
     if (!p) return -1;
     memcpy(p, src, len);
+    g_block_writes++;
+    const uint32_t a = addr & PSP_ADDR_MASK, e = a + len;
+    int seen = 0;
+    for (int i = 0; i < 8; i++) if (a < g_recent_e[i] && g_recent_a[i] < e) seen = 1;
+    if (len >= (96u << 10) || (len >= (4u << 10) && !seen)) g_load_writes++;
+    g_recent_a[g_recent_n] = a; g_recent_e[g_recent_n] = e;
+    g_recent_n = (g_recent_n + 1) & 7;
     return 0;
 }
 

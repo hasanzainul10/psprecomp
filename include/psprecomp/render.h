@@ -253,6 +253,10 @@ void psp_gpu_dump_next_frame(const char *path);
 void psp_gpu_decode_texture(uint32_t *out);
 /* For backends: a hash of the current texture's bytes (and CLUT). */
 uint64_t psp_gpu_texture_hash(void);
+/* The two halves: the bytes alone, and the CLUT (0 for a format without
+ * one), so a backend can check the cheap CLUT more often than the bytes. */
+uint64_t psp_gpu_texture_data_hash(void);
+uint64_t psp_gpu_clut_hash(void);
 /* For backends with their own decoder: the current texture (level 0) as a
  * pointer to its bytes and its layout, and for the paletted formats the
  * colour of every index (0xAABBGGRR, the CLUT's shift, mask and offset

@@ -159,6 +159,13 @@ PSP_MEM_WR(psp_write_f32, float)
 
 /* Bulk copy into guest memory — used by the loader to place PRX segments. */
 int psp_mem_write_block(uint32_t addr, const void *src, uint32_t len);
+/* How many psp_mem_write_block copies so far (file reads land in memory
+ * this way): a host's sign that the game is loading, e.g. to re-check cached
+ * textures every frame while it does. */
+uint32_t psp_mem_block_writes(void);
+/* Of those, the ones that look like loading rather than a stream refilling
+ * one buffer (mem.c says how they are told apart). */
+uint32_t psp_mem_load_writes(void);
 int psp_mem_read_block(void *dst, uint32_t addr, uint32_t len);
 
 #ifdef __cplusplus
