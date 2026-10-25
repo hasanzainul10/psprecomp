@@ -66,6 +66,7 @@ typedef SOCKET hsock;
 #else
 #  include <errno.h>
 #  include <fcntl.h>
+#  include <arpa/inet.h>             /* htons & co. (the 3DS's newlib has them only here) */
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <sys/select.h>

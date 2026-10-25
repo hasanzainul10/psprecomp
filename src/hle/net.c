@@ -35,8 +35,12 @@
 #  include <ws2tcpip.h>
 #  include <iphlpapi.h>
 #else
-#  include <ifaddrs.h>
-#  include <net/if.h>
+#  ifdef PSPRECOMP_3DS
+#    include <3ds.h>                 /* SOCU_GetIPInfo: libctru has no getifaddrs */
+#  else
+#    include <ifaddrs.h>
+#    include <net/if.h>
+#  endif
 #  include <netinet/in.h>
 #  include <arpa/inet.h>
 #  include <netdb.h>
@@ -137,6 +141,16 @@ static int host_info_query(psp_net_host *out) {
             }
         }
         free(list);
+#elif defined(PSPRECOMP_3DS)
+        /* the console's own WiFi; needs the host's socInit (online is a
+         * late phase there), and reads as not connected without it */
+        struct in_addr ip, mask, bcast;
+        if (SOCU_GetIPInfo(&ip, &mask, &bcast) == 0 && ip.s_addr) {
+            h.connected = 1;
+            h.wireless = 1;
+            h.ipv4 = ntohl(ip.s_addr);
+            h.netmask = ntohl(mask.s_addr);
+        }
 #else
         struct ifaddrs *ifs = NULL;
         if (getifaddrs(&ifs) == 0) {

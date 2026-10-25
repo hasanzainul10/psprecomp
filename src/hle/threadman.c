@@ -58,6 +58,9 @@
  * needs, since its GL context and event pump belong to that thread. Elsewhere
  * (or with PSPRECOMP_THREAD_FIBERS) each fiber is a host thread and switching
  * hands a baton from one to the next, so exactly one ever runs. */
+#if defined(PSPRECOMP_3DS) && !defined(PSPRECOMP_THREAD_FIBERS) && !defined(PSPRECOMP_ASM_FIBERS)
+#  define PSPRECOMP_ASM_FIBERS 1          /* 32-bit ARM below; no ucontext in newlib */
+#endif
 #if (defined(__ANDROID__) || (defined(__APPLE__) && defined(__aarch64__))) && !defined(PSPRECOMP_THREAD_FIBERS) && !defined(PSPRECOMP_ASM_FIBERS)
 #  if defined(__aarch64__) || defined(__x86_64__)
 #    define PSPRECOMP_ASM_FIBERS 1
@@ -155,8 +158,16 @@ static const char *const WAIT_NAME[] = {
 /* Host stack per PSP thread. Recompiled code nests one C frame per guest call
  * plus one per tail call, and the generated functions can have large frames,
  * so this is generous. Only `reserve` is address space; pages are committed
- * on demand. */
-#define FIBER_STACK_RESERVE (64u << 20)
+ * on demand. The 3DS commits what it allocates and has ~94 MB for
+ * everything, so its stacks are real memory and much smaller (a build can
+ * set PSPRECOMP_FIBER_STACK). */
+#if defined(PSPRECOMP_FIBER_STACK)
+#  define FIBER_STACK_RESERVE ((size_t)(PSPRECOMP_FIBER_STACK))
+#elif defined(PSPRECOMP_3DS)
+#  define FIBER_STACK_RESERVE (1u << 20)
+#else
+#  define FIBER_STACK_RESERVE (64u << 20)
+#endif
 
 #if defined(_WIN32)
 typedef void *fiber_t;
@@ -218,8 +229,24 @@ __asm__(
     "psp_fiber_start:\n"
     "  movq %r13, %rdi\n  callq *%r12\n  ud2\n"
     ".size psp_fiber_start, .-psp_fiber_start\n");
+#elif defined(__arm__)
+/* 32-bit ARM (the 3DS's ARM11, hard-float): d8-d15, then r3-r11 and lr.
+ * r3 is only there to keep the frame a multiple of 8 bytes, as AAPCS wants
+ * the stack. 104 bytes. r4 = entry, r5 = arg. */
+__asm__(
+    ".text\n.arm\n.p2align 2\n"
+    ".globl psp_fiber_switch\n.type psp_fiber_switch, %function\n"
+    "psp_fiber_switch:\n"
+    "  push {r3-r11, lr}\n  vpush {d8-d15}\n"
+    "  str sp, [r0]\n  mov sp, r1\n"
+    "  vpop {d8-d15}\n  pop {r3-r11, pc}\n"
+    ".size psp_fiber_switch, .-psp_fiber_switch\n"
+    ".globl psp_fiber_start\n.type psp_fiber_start, %function\n"
+    "psp_fiber_start:\n"
+    "  mov r0, r5\n  blx r4\n  udf #0\n"
+    ".size psp_fiber_start, .-psp_fiber_start\n");
 #else
-#  error "PSPRECOMP_ASM_FIBERS: arm64 or x86-64 only"
+#  error "PSPRECOMP_ASM_FIBERS: arm64, x86-64 or 32-bit ARM only"
 #endif
 #elif defined(PSPRECOMP_THREAD_FIBERS)
 typedef struct host_fiber {
@@ -941,6 +968,14 @@ static void *asm_seed(void *stack, size_t size, void (*fn)(void *), void *arg) {
     frame[0] = (uint64_t)(uintptr_t)fn;                  /* x19 */
     frame[1] = (uint64_t)(uintptr_t)arg;                 /* x20 */
     frame[11] = (uint64_t)(uintptr_t)psp_fiber_start;    /* x30: where the first switch returns */
+#elif defined(__arm__)
+    /* From the saved sp: d8-d15 (16 words), r3 r4 r5 ... r11, lr. After the
+     * pop the stack is back at `top`, 16-aligned. */
+    uint32_t *frame = (uint32_t *)(top - 104);
+    memset(frame, 0, 104);
+    frame[16 + 1] = (uint32_t)(uintptr_t)fn;             /* r4 */
+    frame[16 + 2] = (uint32_t)(uintptr_t)arg;            /* r5 */
+    frame[16 + 9] = (uint32_t)(uintptr_t)psp_fiber_start; /* lr: popped into pc */
 #else
     /* After the return into psp_fiber_start the stack is 16-aligned, as a
      * call needs. Slots from the saved sp: r15 r14 r13 r12 rbx rbp ret. */
