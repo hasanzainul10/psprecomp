@@ -253,6 +253,19 @@ void psp_gpu_dump_next_frame(const char *path);
 void psp_gpu_decode_texture(uint32_t *out);
 /* For backends: a hash of the current texture's bytes (and CLUT). */
 uint64_t psp_gpu_texture_hash(void);
+/* For backends with their own decoder: the current texture (level 0) as a
+ * pointer to its bytes and its layout, and for the paletted formats the
+ * colour of every index (0xAABBGGRR, the CLUT's shift, mask and offset
+ * applied: exactly psp_gpu_decode_texture's). 0 when its bytes aren't in one
+ * mapped range. Texel (x, y)'s byte: y * bufw * bpp / 8 + x * bpp / 8, or in
+ * the swizzled layout 16-byte x 8-row blocks of bufw * bpp / 8 / 16 a row. */
+typedef struct {
+    const uint8_t *data;
+    int      psm, swizzled;
+    uint32_t w, h, bufw;
+    uint32_t pal[256];      /* psm 4: 16 entries, 5: 256; else unset */
+} psp_gpu_texinfo;
+int psp_gpu_texture_info(psp_gpu_texinfo *ti);
 /* For backends that load PPSSPP texture packs (textures.ini, hash = xxh64):
  * the current texture's key as PPSSPP computes it, so a pack's [hashes]
  * lines "AAAAAAAACCCCCCCCDDDDDDDD" match bit for bit. *addr is the address

@@ -2078,6 +2078,24 @@ static void fill_hw_state(psp_gpu_state *st) {
     st->mask_rgb = R[0xE8] & 0xFFFFFF; st->mask_a = R[0xE9] & 0xFF;
 }
 
+int psp_gpu_texture_info(psp_gpu_texinfo *ti) {
+    static const int bpp_of[11] = { 16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8 };
+    ti->psm = (int)(R[0xC3] & 0xF);
+    ti->swizzled = (int)(R[0xC2] & 1);
+    ti->w = tex_w(0); ti->h = tex_h(0); ti->bufw = tex_bufw(0) ? tex_bufw(0) : 1;
+    if (ti->psm > 10) return 0;
+    const uint32_t bytes = ti->psm >= 8
+        ? (ti->bufw / 4 ? ti->bufw / 4 : 1) * (ti->h / 4 ? ti->h / 4 : 1) * (ti->psm == 8 ? 8u : 16u)
+        : tex_extent(ti->w, ti->h, ti->bufw, bpp_of[ti->psm], ti->swizzled);
+    ti->data = mem(tex_addr(0), bytes);
+    if (!ti->data) return 0;
+    if (ti->psm == 4 || ti->psm == 5) {
+        const uint32_t n = ti->psm == 4 ? 16u : 256u;
+        for (uint32_t i = 0; i < n; i++) ti->pal[i] = clut_lookup(i);
+    }
+    return 1;
+}
+
 void psp_gpu_decode_texture(uint32_t *out) {
     const uint32_t w = tex_w(0), h = tex_h(0);
     fast_setup();                                  /* cached texture pointer and palette */
