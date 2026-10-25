@@ -1555,11 +1555,12 @@ static void m44_mul(const float *a, const float *b, float o[16]) {   /* o = a x 
  * loop redoes for every vertex done once per draw: one pointer to the
  * vertices and one to the indices instead of a memory lookup per component,
  * the components decoded in place (comp_at), the registers converted once,
- * and world x view x projection as one matrix where lighting doesn't need the
- * world position. On the 3DS this loop was 3 to 8 us a vertex, and the slow
- * town views draw ~27,000 vertices a frame (3DS_PROGRESS.md, T4). Gives the
- * generic loop's fields; the combined matrix rounds differently in the last
- * bits (PSP2I_VTX_VERIFY measures it). Returns 0 to leave the draw to the
+ * world x view x projection as one matrix where lighting doesn't need the
+ * world position, and the lights prepared once (psp_ge_light_prepare). On
+ * the 3DS this loop was 3 to 8 us a vertex, and the slow town views draw
+ * ~27,000 vertices a frame (3DS_PROGRESS.md, T4). Gives the generic loop's
+ * fields; the combined matrix and the prepared lights round differently in
+ * the last bits (PSP2I_VTX_VERIFY measures it). Returns 0 to leave the draw to the
  * generic loop: the data isn't in one mapped range. */
 static int fast_vertices(uint32_t vt, const layout *L, uint32_t n, uint32_t vaddr, uint32_t iaddr,
                          int itype, int skin, int lit, const psp_ge_lighting *light, pvtx *buf) {
@@ -1596,6 +1597,8 @@ static int fast_vertices(uint32_t vt, const layout *L, uint32_t n, uint32_t vadd
     m44_mul(g_proj, v4, vp);
     if (!lit) { m43_to_44(g_world, w4); m44_mul(vp, w4, m); }
     const float *cm = lit ? vp : m;
+    psp_ge_light_prep lp;                                /* the lights, once per draw */
+    if (lit) psp_ge_light_prepare(light, &lp);
 
     for (uint32_t i = 0; i < n; i++) {
         const uint8_t *a = vb + (ix ? index_at(ix, itype, i) : i) * (uint32_t)L->stride;
@@ -1633,7 +1636,7 @@ static int fast_vertices(uint32_t vt, const layout *L, uint32_t n, uint32_t vadd
             if (l > 0) for (int k = 0; k < 3; k++) wn[k] /= l;
             const float in[4] = { o->s.r / 255.0f, o->s.g / 255.0f, o->s.b / 255.0f, o->s.a / 255.0f };
             float c[4];
-            psp_ge_light(light, in, p3, wn, c);
+            psp_ge_light_fast(&lp, in, p3, wn, c);
             o->s.r = c[0] * 255.0f; o->s.g = c[1] * 255.0f; o->s.b = c[2] * 255.0f; o->s.a = c[3] * 255.0f;
         } else {
             memcpy(p3, mp, sizeof p3);                      /* m includes the world */
@@ -1662,7 +1665,7 @@ static int fast_vertices(uint32_t vt, const layout *L, uint32_t n, uint32_t vadd
  * and the two compared; the largest differences are logged every 200,000
  * vertices. */
 static int g_vverify = -1;
-static struct { uint64_t verts, off; float pos, depth, uv, col, clip, px; } g_vv;   /* px: on screen, in pixels */
+static struct { uint64_t verts, off, lit; float pos, depth, uv, col, clip, px; } g_vv;   /* px: on screen, in pixels */
 
 static float rel_diff(float a, float b) {
     const float d = fabsf(a - b), s = fabsf(a) > 1.0f ? fabsf(a) : 1.0f;
@@ -1675,6 +1678,7 @@ static void vverify_draw(uint32_t vt, const layout *L, uint32_t n, uint32_t vadd
     static uint32_t cap;
     if (n > cap) { free(tmp); tmp = (pvtx *)malloc(sizeof *tmp * n); cap = tmp ? n : 0; }
     if (!tmp || !fast_vertices(vt, L, n, vaddr, iaddr, itype, skin, lit, light, tmp)) return;
+    if (lit) g_vv.lit += n;
     for (uint32_t i = 0; i < n; i++) {
         const pvtx *a = &ref[i], *b = &tmp[i];
         const float dp = fmaxf(rel_diff(a->s.x, b->s.x), rel_diff(a->s.y, b->s.y));
@@ -1694,9 +1698,9 @@ static void vverify_draw(uint32_t vt, const layout *L, uint32_t n, uint32_t vadd
         }
         if (dp > 1e-3f || du > 1e-4f || dc > 0.5f || (a->s.w == 0) != (b->s.w == 0)) g_vv.off++;
         if (++g_vv.verts % 200000 == 0)
-            fprintf(stderr, "vtx-verify: %llu vertices, %llu off (xy > 1e-3, uv > 1e-4, colour > 0.5, w side); "
+            fprintf(stderr, "vtx-verify: %llu vertices (%llu lit), %llu off (xy > 1e-3, uv > 1e-4, colour > 0.5, w side); "
                             "largest: xy %.2g (on screen %.3g px), z %.2g, uv %.2g, colour %.3g, clip %.2g\n",
-                    (unsigned long long)g_vv.verts, (unsigned long long)g_vv.off,
+                    (unsigned long long)g_vv.verts, (unsigned long long)g_vv.lit, (unsigned long long)g_vv.off,
                     g_vv.pos, g_vv.px, g_vv.depth, g_vv.uv, g_vv.col, g_vv.clip);
     }
 }

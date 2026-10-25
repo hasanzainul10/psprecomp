@@ -58,6 +58,32 @@ void psp_ge_lighting_from_regs(const uint32_t *regs, int vertex_has_color, psp_g
 void psp_ge_light(const psp_ge_lighting *L, const float color[4], const float pos[3],
                   const float nrm[3], float out[4]);
 
+/* psp_ge_light with what is constant within a draw worked out once
+ * (psp_ge_light_prepare): a directional light's direction and half vector,
+ * the light x material colours where the material isn't the vertex colour,
+ * the directional lights' ambient folded into one term, and terms whose
+ * colour is zero left out. The same results to float rounding. */
+typedef struct {
+    int   type, comp, dif_on, spec_on;
+    float to[3], hn[3];     /* directional: unit direction (or 0), unit half vector */
+    int   to_ok, hn_ok;
+    float pos[3], dir[3], att[3], spot_exp, spot_cut;   /* point and spot */
+    float amb[3], dif[3], spc[3];   /* light colour x material, or the light colour alone
+                                       where the material comes from the vertex */
+} psp_ge_light_one;
+typedef struct {
+    int   n;
+    psp_ge_light_one l[4];
+    float emissive[3], amb_all[3];  /* global ambient + directional lights' ambient */
+    float amb_alpha;                /* global ambient alpha */
+    float mat_amb[4];               /* when not from the vertex */
+    int   mat_update;
+    float shininess;
+} psp_ge_light_prep;
+void psp_ge_light_prepare(const psp_ge_lighting *L, psp_ge_light_prep *P);
+void psp_ge_light_fast(const psp_ge_light_prep *P, const float color[4], const float pos[3],
+                       const float nrm[3], float out[4]);
+
 /* Shade (environment) mapping, texture map mode 2: u and v from two lights'
  * directions against the world-space normal, in 0..1 before UV scale. */
 void psp_ge_shade_map(const uint32_t *regs, const float nrm[3], float uv[2]);

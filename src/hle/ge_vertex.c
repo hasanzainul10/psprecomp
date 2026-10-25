@@ -173,6 +173,107 @@ void psp_ge_light(const psp_ge_lighting *L, const float color[4], const float po
     for (int k = 0; k < 4; k++) out[k] = sum[k] < 0.0f ? 0.0f : sum[k] > 1.0f ? 1.0f : sum[k];
 }
 
+static int any3(const float v[3]) { return v[0] != 0.0f || v[1] != 0.0f || v[2] != 0.0f; }
+
+void psp_ge_light_prepare(const psp_ge_lighting *L, psp_ge_light_prep *P) {
+    memset(P, 0, sizeof *P);
+    P->mat_update = L->mat_update;
+    P->shininess = L->shininess;
+    memcpy(P->emissive, L->mat_emissive, sizeof P->emissive);
+    memcpy(P->amb_all, L->global_ambient, sizeof P->amb_all);
+    P->amb_alpha = L->global_ambient[3];
+    memcpy(P->mat_amb, L->mat_ambient, sizeof P->mat_amb);
+    const int amb_v = L->mat_update & 1, dif_v = L->mat_update & 2, spc_v = L->mat_update & 4;
+    for (int l = 0; l < 4; l++) {
+        if (!L->enabled[l]) continue;
+        psp_ge_light_one *q = &P->l[P->n];
+        q->type = L->type[l];
+        q->comp = L->comp[l];
+        for (int k = 0; k < 3; k++) {
+            q->amb[k] = L->ambient[l][k] * (amb_v ? 1.0f : L->mat_ambient[k]);
+            q->dif[k] = L->diffuse[l][k] * (dif_v ? 1.0f : L->mat_diffuse[k]);
+            q->spc[k] = L->specular[l][k] * (spc_v ? 1.0f : L->mat_specular[k]);
+        }
+        q->dif_on = any3(q->dif);
+        q->spec_on = q->comp == 1 && any3(q->spc);
+        if (q->type == 0) {
+            /* constant within the draw: the direction, its half vector with
+             * the GE's fixed viewer at +z, and the ambient (scale 1) */
+            const float dist = sqrtf(dot3(L->pos[l], L->pos[l]));
+            q->to_ok = dist > 0.0f;
+            for (int k = 0; k < 3; k++) q->to[k] = q->to_ok ? L->pos[l][k] / dist : 0.0f;
+            const float h[3] = { q->to[0], q->to[1], q->to[2] + 1.0f };
+            const float hl = sqrtf(dot3(h, h));
+            q->hn_ok = hl > 0.0f;
+            for (int k = 0; k < 3; k++) q->hn[k] = q->hn_ok ? h[k] / hl : 0.0f;
+            for (int k = 0; k < 3; k++) P->amb_all[k] += L->ambient[l][k];
+            if (!q->dif_on && !q->spec_on) continue;            /* nothing per vertex */
+        } else {
+            memcpy(q->pos, L->pos[l], sizeof q->pos);
+            memcpy(q->att, L->att[l], sizeof q->att);
+            const float len = sqrtf(dot3(L->dir[l], L->dir[l]));
+            for (int k = 0; k < 3; k++) q->dir[k] = len > 0.0f ? L->dir[l][k] / len : 0.0f;
+            q->spot_exp = L->spot_exp[l];
+            q->spot_cut = L->spot_cut[l];
+        }
+        P->n++;
+    }
+}
+
+void psp_ge_light_fast(const psp_ge_light_prep *P, const float color[4], const float pos[3],
+                       const float nrm[3], float out[4]) {
+    const int amb_v = P->mat_update & 1, dif_v = P->mat_update & 2, spc_v = P->mat_update & 4;
+    const float *amb = amb_v ? color : P->mat_amb;
+    float sum[4], spec[3] = { 0, 0, 0 };
+    for (int k = 0; k < 3; k++) sum[k] = P->emissive[k] + P->amb_all[k] * amb[k];
+    sum[3] = P->amb_alpha * amb[3];
+
+    for (int i = 0; i < P->n; i++) {
+        const psp_ge_light_one *q = &P->l[i];
+        float d = 0.0f, scale = 1.0f, s = 0.0f;
+        if (q->type == 0) {
+            if (q->dif_on && q->to_ok) d = dot3(q->to, nrm);
+            if (q->spec_on && q->hn_ok) s = dot3(q->hn, nrm);
+        } else {
+            float to[3];
+            for (int k = 0; k < 3; k++) to[k] = q->pos[k] - pos[k];
+            const float dist = sqrtf(dot3(to, to));
+            if (dist > 0.0f) {
+                const float id = 1.0f / dist;
+                for (int k = 0; k < 3; k++) to[k] *= id;
+                d = dot3(to, nrm);
+            }
+            const float a = q->att[0] + q->att[1] * dist + q->att[2] * dist * dist;
+            scale = a > 0.0f ? 1.0f / a : 1.0f;
+            if (scale > 1.0f) scale = 1.0f;
+            if (scale < 0.0f) scale = 0.0f;
+            if (q->type >= 2) {
+                const float ang = dot3(q->dir, to);
+                scale = ang >= q->spot_cut ? scale * light_pow(ang, q->spot_exp) : 0.0f;
+            }
+            for (int k = 0; k < 3; k++) sum[k] += q->amb[k] * (amb_v ? color[k] : 1.0f) * scale;
+            if (q->spec_on) {
+                const float h[3] = { to[0], to[1], to[2] + 1.0f };
+                const float hl = sqrtf(dot3(h, h));
+                s = hl > 0.0f ? dot3(h, nrm) / hl : 0.0f;
+            }
+        }
+        if (q->dif_on) {
+            if (d < 0.0f) d = 0.0f;
+            if (q->comp == 2) d = light_pow(d, P->shininess);
+            const float ds = d * scale;
+            for (int k = 0; k < 3; k++) sum[k] += q->dif[k] * (dif_v ? color[k] : 1.0f) * ds;
+        }
+        if (q->spec_on && s > 0.0f) {
+            const float p = light_pow(s, P->shininess) * scale;
+            for (int k = 0; k < 3; k++) spec[k] += q->spc[k] * (spc_v ? color[k] : 1.0f) * p;
+        }
+    }
+
+    for (int k = 0; k < 3; k++) sum[k] += spec[k];
+    for (int k = 0; k < 4; k++) out[k] = sum[k] < 0.0f ? 0.0f : sum[k] > 1.0f ? 1.0f : sum[k];
+}
+
 void psp_ge_shade_map(const uint32_t *R, const float nrm[3], float uv[2]) {
     const int ls[2] = { (int)(R[0xC1] & 3), (int)((R[0xC1] >> 8) & 3) };
     for (int i = 0; i < 2; i++) {
