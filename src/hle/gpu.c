@@ -1457,6 +1457,36 @@ static uint64_t g_prim_ticks;
 void psp_gpu_set_clock(uint64_t (*now)(void)) { g_clock = now; }
 uint64_t psp_gpu_prim_ticks(void) { return g_prim_ticks; }
 
+#define MAX_VKINDS 64
+static psp_gpu_vkind g_vk[MAX_VKINDS];
+static int g_nvk;
+
+static void vkind_add(uint32_t kind, uint32_t verts, uint64_t ticks) {
+    int i = 0;
+    while (i < g_nvk && g_vk[i].kind != kind) i++;
+    if (i == g_nvk) {
+        if (g_nvk == MAX_VKINDS) return;
+        memset(&g_vk[g_nvk], 0, sizeof g_vk[0]);
+        g_vk[g_nvk++].kind = kind;
+    }
+    g_vk[i].draws++;
+    g_vk[i].verts += verts;
+    g_vk[i].ticks += ticks;
+}
+
+static int vkind_cmp(const void *a, const void *b) {
+    const uint64_t x = ((const psp_gpu_vkind *)a)->ticks, y = ((const psp_gpu_vkind *)b)->ticks;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+int psp_gpu_vkinds_take(psp_gpu_vkind *out, int max) {
+    qsort(g_vk, (size_t)g_nvk, sizeof g_vk[0], vkind_cmp);
+    const int n = g_nvk < max ? g_nvk : max;
+    memcpy(out, g_vk, sizeof g_vk[0] * (size_t)n);
+    g_nvk = 0;
+    return n;
+}
+
 void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr) {
     if (!g_clock) { gpu_prim_moved(type, count, vaddr, iaddr); return; }
     const uint64_t t0 = g_clock();
@@ -1530,6 +1560,7 @@ static void gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iad
     const int map_mode = g_through ? 0 : (int)(R[0xC0] & 3);
     psp_ge_lighting light;
     if (lit) psp_ge_lighting_from_regs(R, L.c_off >= 0, &light);
+    const uint64_t vt0 = g_clock ? g_clock() : 0;
 
     for (uint32_t i = 0; i < n; i++) {
         uint32_t idx = i;
@@ -1568,6 +1599,22 @@ static void gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iad
             if (o->clip[3] > W_EPS) to_screen(o->clip, &o->s);
             else o->s.w = 0;
         }
+    }
+    if (g_clock) {
+        uint32_t kind = skin ? VT_NWEIGHT(vt) : 0;
+        if (lit) {
+            uint32_t nl = 0;
+            for (int l = 0; l < 4; l++) {
+                if (!light.enabled[l]) continue;
+                nl++;
+                if (light.comp[l] != 0 || light.type[l] >= 2) kind |= PSP_VK_POW;
+            }
+            kind |= nl << 4;
+        }
+        if (g_through) kind |= PSP_VK_THROUGH;
+        if (map_mode == 1 || map_mode == 2) kind |= PSP_VK_TEXGEN;
+        if (VT_MORPH(vt) > 1) kind |= PSP_VK_MORPH;
+        vkind_add(kind, n, g_clock() - vt0);
     }
 
     if (g_observer) {

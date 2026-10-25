@@ -225,6 +225,20 @@ const psp_gpu_backend *psp_gpu_get_backend(void);
 void psp_gpu_set_clock(uint64_t (*now)(void));
 uint64_t psp_gpu_prim_ticks(void);
 
+/* The CPU's per-vertex loop by kind of draw, with the clock above: which
+ * vertex work (skinning, lights, powf) the GE time goes to. `kind`: bits 0-3
+ * skin weights, 4-6 lights on, 7 a light needs powf (specular, powered
+ * diffuse or spot), 8 through mode, 9 texgen, 10 morph. */
+#define PSP_VK_WEIGHTS(k) ((k) & 15u)
+#define PSP_VK_LIGHTS(k)  (((k) >> 4) & 7u)
+#define PSP_VK_POW        (1u << 7)
+#define PSP_VK_THROUGH    (1u << 8)
+#define PSP_VK_TEXGEN     (1u << 9)
+#define PSP_VK_MORPH      (1u << 10)
+typedef struct { uint32_t kind; uint64_t draws, verts, ticks; } psp_gpu_vkind;
+/* The kinds since the last call, most ticks first (at most `max`); resets. */
+int psp_gpu_vkinds_take(psp_gpu_vkind *out, int max);
+
 /* GE sync point (sceGeDrawSync/ListSync): bring emulated VRAM up to date with
  * the hardware backend's render targets, and have the targets re-check VRAM
  * for CPU writes before their next draw. No-op for the software rasterizer. */
