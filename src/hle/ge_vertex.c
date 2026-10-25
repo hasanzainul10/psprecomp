@@ -18,6 +18,41 @@ static void rgb(uint32_t arg, float out[3]) {
     for (int k = 0; k < 3; k++) out[k] = (float)((arg >> (8 * k)) & 0xFF) / 255.0f;
 }
 
+/* x^y for the lights' specular, powered diffuse and spot terms. On the 3DS
+ * powf is a long software routine, called per light per vertex (two lights
+ * with it made a skinned vertex 8 us in town: 3DS_PROGRESS.md, T4); there
+ * 2^(y log2 x) from the float's bits and two short series, ~1e-5 relative
+ * error, far below a colour step. Elsewhere, and outside (0, inf) x finite
+ * y, powf itself. */
+#ifdef PSPRECOMP_3DS
+static float light_pow(float x, float y) {
+    if (!(x > 0.0f) || !(x < 3.0e38f) || !(y > -1e30f && y < 1e30f)) return powf(x, y);
+    uint32_t b;
+    memcpy(&b, &x, 4);
+    int e = (int)((b >> 23) & 0xFF) - 127;
+    if (e < -126) return powf(x, y);                            /* denormal */
+    b = (b & 0x007FFFFFu) | 0x3F800000u;
+    float m;
+    memcpy(&m, &b, 4);                                          /* [1, 2) */
+    if (m > 1.41421356f) { m *= 0.5f; e++; }                    /* [0.71, 1.41): exact near x = 1 */
+    /* log2 m = 2/ln2 (t + t^3/3 + t^5/5 + t^7/7), t = (m-1)/(m+1), |t| < 0.18 */
+    const float t = (m - 1.0f) / (m + 1.0f), t2 = t * t;
+    const float lg = (float)e + 2.8853900817779268f * t * (1.0f + t2 * (1.0f / 3 + t2 * (1.0f / 5 + t2 * (1.0f / 7))));
+    const float z = y * lg;
+    if (z >= 128.0f) return powf(x, y);
+    if (z < -126.0f) return 0.0f;
+    const float fl = floorf(z), f = (z - fl) * 0.69314718055994531f;
+    /* e^f, f in [0, ln 2): the series to f^6 */
+    const float ef = 1.0f + f * (1.0f + f * (0.5f + f * (1.0f / 6 + f * (1.0f / 24 + f * (1.0f / 120 + f * (1.0f / 720))))));
+    const uint32_t sb = (uint32_t)((int)fl + 127) << 23;
+    float s;
+    memcpy(&s, &sb, 4);
+    return ef * s;
+}
+#else
+#define light_pow powf
+#endif
+
 void psp_ge_mul43(const float *m, const float in[3], float out[3]) {
     float x = in[0], y = in[1], z = in[2];
     out[0] = x * m[0] + y * m[3] + z * m[6] + m[9];
@@ -104,7 +139,7 @@ void psp_ge_light(const psp_ge_lighting *L, const float color[4], const float po
             d = dot3(to, nrm);
         }
         if (d < 0.0f) d = 0.0f;
-        if (L->comp[l] == 2) d = powf(d, L->shininess);
+        if (L->comp[l] == 2) d = light_pow(d, L->shininess);
 
         float scale = 1.0f;
         if (L->type[l] != 0) {
@@ -115,7 +150,7 @@ void psp_ge_light(const psp_ge_lighting *L, const float color[4], const float po
             if (L->type[l] >= 2) {                                     /* spot */
                 const float len = sqrtf(dot3(L->dir[l], L->dir[l]));
                 const float ang = len > 0.0f ? dot3(L->dir[l], to) / len : 0.0f;
-                scale = ang >= L->spot_cut[l] ? scale * powf(ang, L->spot_exp[l]) : 0.0f;
+                scale = ang >= L->spot_cut[l] ? scale * light_pow(ang, L->spot_exp[l]) : 0.0f;
             }
         }
 
@@ -128,7 +163,7 @@ void psp_ge_light(const psp_ge_lighting *L, const float color[4], const float po
             const float hl = sqrtf(dot3(h, h));
             const float s = hl > 0.0f ? dot3(h, nrm) / hl : 0.0f;
             if (s > 0.0f) {
-                const float p = powf(s, L->shininess) * scale;
+                const float p = light_pow(s, L->shininess) * scale;
                 for (int k = 0; k < 3; k++) spec[k] += L->specular[l][k] * spc[k] * p;
             }
         }

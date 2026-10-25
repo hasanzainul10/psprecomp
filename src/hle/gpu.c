@@ -1519,6 +1519,188 @@ static void gpu_prim_moved(uint32_t type, uint32_t count, uint32_t vaddr, uint32
     gpu_prim(type, count, vaddr, iaddr);
 }
 
+/* ---- the transformed vertices' fast path ---------------------------------------- */
+
+/* One component straight from memory: comp() without its lookup per value. */
+static inline float comp_at(const uint8_t *p, int fmt, int is_signed) {
+    switch (fmt) {
+    case 1: return (float)(is_signed ? (int)(int8_t)p[0] : (int)p[0]) * (1.0f / 128.0f);
+    case 2: { uint16_t v; memcpy(&v, p, 2); return (float)(is_signed ? (int)(int16_t)v : (int)v) * (1.0f / 32768.0f); }
+    case 3: { float f; memcpy(&f, p, 4); return f; }
+    default: return 0.0f;
+    }
+}
+
+static inline uint32_t index_at(const uint8_t *ix, int itype, uint32_t i) {
+    if (itype == 1) return ix[i];
+    if (itype == 2) { uint16_t v; memcpy(&v, ix + i * 2, 2); return v; }
+    uint32_t v; memcpy(&v, ix + i * 4, 4); return v;
+}
+
+/* Column-major 4x4 from a 4x3 (columns x, y, z, translation; row 3 = 0 0 0 1). */
+static void m43_to_44(const float *m, float o[16]) {
+    for (int c = 0; c < 4; c++) {
+        for (int r = 0; r < 3; r++) o[c * 4 + r] = m[c * 3 + r];
+        o[c * 4 + 3] = c == 3 ? 1.0f : 0.0f;
+    }
+}
+
+static void m44_mul(const float *a, const float *b, float o[16]) {   /* o = a x b */
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++)
+            o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+}
+
+/* The common transformed draw (no morph, no texgen), with what the generic
+ * loop redoes for every vertex done once per draw: one pointer to the
+ * vertices and one to the indices instead of a memory lookup per component,
+ * the components decoded in place (comp_at), the registers converted once,
+ * and world x view x projection as one matrix where lighting doesn't need the
+ * world position. On the 3DS this loop was 3 to 8 us a vertex, and the slow
+ * town views draw ~27,000 vertices a frame (3DS_PROGRESS.md, T4). Gives the
+ * generic loop's fields; the combined matrix rounds differently in the last
+ * bits (PSP2I_VTX_VERIFY measures it). Returns 0 to leave the draw to the
+ * generic loop: the data isn't in one mapped range. */
+static int fast_vertices(uint32_t vt, const layout *L, uint32_t n, uint32_t vaddr, uint32_t iaddr,
+                         int itype, int skin, int lit, const psp_ge_lighting *light, pvtx *buf) {
+    const uint8_t *ix = NULL;
+    uint32_t maxi = n - 1;
+    if (itype) {
+        ix = mem(iaddr, n * (itype == 1 ? 1u : itype == 2 ? 2u : 4u));
+        if (!ix) return 0;
+        maxi = 0;
+        for (uint32_t i = 0; i < n; i++) { const uint32_t v = index_at(ix, itype, i); if (v > maxi) maxi = v; }
+        if (maxi >= (16u << 20) / (uint32_t)L->stride) return 0;
+    }
+    const uint8_t *vb = mem(vaddr, (maxi + 1) * (uint32_t)L->stride);
+    if (!vb) return 0;
+
+    const int wf = (int)VT_WEIGHT(vt), tf = (int)VT_TEX(vt), cf = (int)VT_COLOR(vt);
+    const int nf = (int)VT_NORMAL(vt), pf = (int)VT_POS(vt), nw = (int)VT_NWEIGHT(vt);
+    const int ws = comp_size(wf), ts = comp_size(tf), ns = comp_size(nf), ps = comp_size(pf);
+    float su = ge_float(R[0x48]), sv = ge_float(R[0x49]);
+    const float ou = ge_float(R[0x4A]), ov = ge_float(R[0x4B]);
+    if (su == 0 && sv == 0) su = sv = 1.0f;
+    const float tw = (float)tex_w(0), th = (float)tex_h(0);
+    const uint32_t mc = R[0x55];
+    const float mr = (float)(mc & 0xFF), mg = (float)((mc >> 8) & 0xFF), mb = (float)((mc >> 16) & 0xFF);
+    const float ma = (float)(R[0x58] & 0xFF);
+    const float sx = ge_float(R[0x42]), sy = ge_float(R[0x43]), sz = ge_float(R[0x44]);
+    const float cx = ge_float(R[0x45]), cy = ge_float(R[0x46]), cz = ge_float(R[0x47]);
+    const float ox = (float)(R[0x4C] & 0xFFFF) / 16.0f, oy = (float)(R[0x4D] & 0xFFFF) / 16.0f;
+    const int reverse = (int)(R[0x51] & 1);
+    /* lit: world position (for the lights), then view x projection;
+     * unlit: model position straight to clip space */
+    float w4[16], v4[16], vp[16], m[16];
+    m43_to_44(g_view, v4);
+    m44_mul(g_proj, v4, vp);
+    if (!lit) { m43_to_44(g_world, w4); m44_mul(vp, w4, m); }
+    const float *cm = lit ? vp : m;
+
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *a = vb + (ix ? index_at(ix, itype, i) : i) * (uint32_t)L->stride;
+        pvtx *o = &buf[i];
+        float w[8], uv[2] = { 0, 0 }, nrm[3] = { 0, 0, 0 }, pos[3] = { 0, 0, 0 };
+        if (skin) for (int k = 0; k < nw; k++) w[k] = comp_at(a + L->w_off + k * ws, wf, 0);
+        if (L->t_off >= 0) { uv[0] = comp_at(a + L->t_off, tf, 0); uv[1] = comp_at(a + L->t_off + ts, tf, 0); }
+        if (L->c_off >= 0) {
+            uint32_t c;
+            uint16_t h;
+            switch (cf) {
+            case 4:  memcpy(&h, a + L->c_off, 2); c = c5650(h); break;
+            case 5:  memcpy(&h, a + L->c_off, 2); c = c5551(h); break;
+            case 6:  memcpy(&h, a + L->c_off, 2); c = c4444(h); break;
+            default: memcpy(&c, a + L->c_off, 4); break;
+            }
+            o->s.r = (float)(c & 0xFF); o->s.g = (float)((c >> 8) & 0xFF);
+            o->s.b = (float)((c >> 16) & 0xFF); o->s.a = (float)(c >> 24);
+        } else {
+            o->s.r = mr; o->s.g = mg; o->s.b = mb; o->s.a = ma;
+        }
+        if (L->n_off >= 0) for (int k = 0; k < 3; k++) nrm[k] = comp_at(a + L->n_off + k * ns, nf, 1);
+        if (L->p_off >= 0) for (int k = 0; k < 3; k++) pos[k] = comp_at(a + L->p_off + k * ps, pf, 1);
+
+        float mp[3], mn[3];
+        if (skin) psp_ge_skin(g_bone, w, nw, pos, nrm, mp, mn);
+        else { memcpy(mp, pos, sizeof mp); memcpy(mn, nrm, sizeof mn); }
+        float p3[3];
+        if (lit) {
+            float wn[3];
+            psp_ge_mul43(g_world, mp, p3);                  /* world position */
+            if (reverse) for (int k = 0; k < 3; k++) mn[k] = -mn[k];
+            psp_ge_mul33(g_world, mn, wn);
+            const float l = sqrtf(wn[0] * wn[0] + wn[1] * wn[1] + wn[2] * wn[2]);
+            if (l > 0) for (int k = 0; k < 3; k++) wn[k] /= l;
+            const float in[4] = { o->s.r / 255.0f, o->s.g / 255.0f, o->s.b / 255.0f, o->s.a / 255.0f };
+            float c[4];
+            psp_ge_light(light, in, p3, wn, c);
+            o->s.r = c[0] * 255.0f; o->s.g = c[1] * 255.0f; o->s.b = c[2] * 255.0f; o->s.a = c[3] * 255.0f;
+        } else {
+            memcpy(p3, mp, sizeof p3);                      /* m includes the world */
+        }
+        o->s.u = (uv[0] * su + ou) * tw;
+        o->s.v = (uv[1] * sv + ov) * th;
+        float *cl = o->clip;
+        cl[0] = p3[0] * cm[0] + p3[1] * cm[4] + p3[2] * cm[8] + cm[12];
+        cl[1] = p3[0] * cm[1] + p3[1] * cm[5] + p3[2] * cm[9] + cm[13];
+        cl[2] = p3[0] * cm[2] + p3[1] * cm[6] + p3[2] * cm[10] + cm[14];
+        cl[3] = p3[0] * cm[3] + p3[1] * cm[7] + p3[2] * cm[11] + cm[15];
+        if (cl[3] > W_EPS) {
+            const float iw = 1.0f / cl[3];
+            o->s.x = cl[0] * iw * sx + cx - ox;
+            o->s.y = cl[1] * iw * sy + cy - oy;
+            o->s.z = cl[2] * iw * sz + cz;
+            o->s.w = iw;
+        } else {
+            o->s.x = o->s.y = o->s.z = o->s.w = 0.0f;
+        }
+    }
+    return 1;
+}
+
+/* PSP2I_VTX_VERIFY=1: every fast-path draw is also done by the generic loop
+ * and the two compared; the largest differences are logged every 200,000
+ * vertices. */
+static int g_vverify = -1;
+static struct { uint64_t verts, off; float pos, depth, uv, col, clip, px; } g_vv;   /* px: on screen, in pixels */
+
+static float rel_diff(float a, float b) {
+    const float d = fabsf(a - b), s = fabsf(a) > 1.0f ? fabsf(a) : 1.0f;
+    return d / s;
+}
+
+static void vverify_draw(uint32_t vt, const layout *L, uint32_t n, uint32_t vaddr, uint32_t iaddr, int itype,
+                         int skin, int lit, const psp_ge_lighting *light, const pvtx *ref) {
+    static pvtx *tmp;
+    static uint32_t cap;
+    if (n > cap) { free(tmp); tmp = (pvtx *)malloc(sizeof *tmp * n); cap = tmp ? n : 0; }
+    if (!tmp || !fast_vertices(vt, L, n, vaddr, iaddr, itype, skin, lit, light, tmp)) return;
+    for (uint32_t i = 0; i < n; i++) {
+        const pvtx *a = &ref[i], *b = &tmp[i];
+        const float dp = fmaxf(rel_diff(a->s.x, b->s.x), rel_diff(a->s.y, b->s.y));
+        const float dz = rel_diff(a->s.z, b->s.z);
+        const float du = fmaxf(rel_diff(a->s.u, b->s.u), rel_diff(a->s.v, b->s.v));
+        float dc = 0, dk = 0;
+        dc = fmaxf(fmaxf(fabsf(a->s.r - b->s.r), fabsf(a->s.g - b->s.g)), fmaxf(fabsf(a->s.b - b->s.b), fabsf(a->s.a - b->s.a)));
+        for (int k = 0; k < 4; k++) dk = fmaxf(dk, rel_diff(a->clip[k], b->clip[k]));
+        if (dp > g_vv.pos) g_vv.pos = dp;
+        if (dz > g_vv.depth) g_vv.depth = dz;
+        if (du > g_vv.uv) g_vv.uv = du;
+        if (dc > g_vv.col) g_vv.col = dc;
+        if (dk > g_vv.clip) g_vv.clip = dk;
+        if (a->s.w > 0 && a->s.x >= 0 && a->s.x < 512 && a->s.y >= 0 && a->s.y < 512) {
+            const float d = fmaxf(fabsf(a->s.x - b->s.x), fabsf(a->s.y - b->s.y));
+            if (d > g_vv.px) g_vv.px = d;
+        }
+        if (dp > 1e-3f || du > 1e-4f || dc > 0.5f || (a->s.w == 0) != (b->s.w == 0)) g_vv.off++;
+        if (++g_vv.verts % 200000 == 0)
+            fprintf(stderr, "vtx-verify: %llu vertices, %llu off (xy > 1e-3, uv > 1e-4, colour > 0.5, w side); "
+                            "largest: xy %.2g (on screen %.3g px), z %.2g, uv %.2g, colour %.3g, clip %.2g\n",
+                    (unsigned long long)g_vv.verts, (unsigned long long)g_vv.off,
+                    g_vv.pos, g_vv.px, g_vv.depth, g_vv.uv, g_vv.col, g_vv.clip);
+    }
+}
+
 static void gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr) {
     const uint32_t vt = R[0x12];
     layout L;
@@ -1562,44 +1744,50 @@ static void gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iad
     if (lit) psp_ge_lighting_from_regs(R, L.c_off >= 0, &light);
     const uint64_t vt0 = g_clock ? g_clock() : 0;
 
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t idx = i;
-        if (itype == 1) idx = rd8(iaddr + i);
-        else if (itype == 2) idx = rd16(iaddr + i * 2);
-        else if (itype == 3) idx = rd32(iaddr + i * 4);
-        raw_vertex rv;
-        read_one(vaddr + idx * (uint32_t)morph_stride, vt, &L, &rv);
-        pvtx *o = &buf[i];
-        memset(o, 0, sizeof *o);
-        material_or_vertex(&rv, &o->s);
-        if (g_through) {
-            tex_coords(&rv, &o->s);
-            o->s.x = rv.pos[0]; o->s.y = rv.pos[1]; o->s.z = rv.pos[2]; o->s.w = 1.0f;
-            o->clip[3] = 1.0f;
-        } else {
-            float mp[3], mn[3], wp[3], wn[3] = { 0, 0, 1 };
-            if (skin) psp_ge_skin(g_bone, rv.w, (int)VT_NWEIGHT(vt), rv.pos, rv.nrm, mp, mn);
-            else { memcpy(mp, rv.pos, sizeof mp); memcpy(mn, rv.nrm, sizeof mn); }
-            psp_ge_mul43(g_world, mp, wp);
-            if (lit || map_mode == 2) {
-                if (R[0x51] & 1) for (int k = 0; k < 3; k++) mn[k] = -mn[k];   /* reverse normals */
-                psp_ge_mul33(g_world, mn, wn);
-                float l = sqrtf(wn[0] * wn[0] + wn[1] * wn[1] + wn[2] * wn[2]);
-                if (l > 0) for (int k = 0; k < 3; k++) wn[k] /= l;
+    /* the fast path where it applies (fast_vertices), else the generic loop */
+    if (g_vverify < 0) { const char *e = getenv("PSP2I_VTX_VERIFY"); g_vverify = e && atoi(e) > 0; }
+    const int fast = !g_through && VT_MORPH(vt) == 1 && map_mode == 0;
+    if (!fast || g_vverify || !fast_vertices(vt, &L, n, vaddr, iaddr, itype, skin, lit, &light, buf)) {
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t idx = i;
+            if (itype == 1) idx = rd8(iaddr + i);
+            else if (itype == 2) idx = rd16(iaddr + i * 2);
+            else if (itype == 3) idx = rd32(iaddr + i * 4);
+            raw_vertex rv;
+            read_one(vaddr + idx * (uint32_t)morph_stride, vt, &L, &rv);
+            pvtx *o = &buf[i];
+            memset(o, 0, sizeof *o);
+            material_or_vertex(&rv, &o->s);
+            if (g_through) {
+                tex_coords(&rv, &o->s);
+                o->s.x = rv.pos[0]; o->s.y = rv.pos[1]; o->s.z = rv.pos[2]; o->s.w = 1.0f;
+                o->clip[3] = 1.0f;
+            } else {
+                float mp[3], mn[3], wp[3], wn[3] = { 0, 0, 1 };
+                if (skin) psp_ge_skin(g_bone, rv.w, (int)VT_NWEIGHT(vt), rv.pos, rv.nrm, mp, mn);
+                else { memcpy(mp, rv.pos, sizeof mp); memcpy(mn, rv.nrm, sizeof mn); }
+                psp_ge_mul43(g_world, mp, wp);
+                if (lit || map_mode == 2) {
+                    if (R[0x51] & 1) for (int k = 0; k < 3; k++) mn[k] = -mn[k];   /* reverse normals */
+                    psp_ge_mul33(g_world, mn, wn);
+                    float l = sqrtf(wn[0] * wn[0] + wn[1] * wn[1] + wn[2] * wn[2]);
+                    if (l > 0) for (int k = 0; k < 3; k++) wn[k] /= l;
+                }
+                if (lit) {
+                    const float in[4] = { o->s.r / 255.0f, o->s.g / 255.0f, o->s.b / 255.0f, o->s.a / 255.0f };
+                    float c[4];
+                    psp_ge_light(&light, in, wp, wn, c);
+                    o->s.r = c[0] * 255.0f; o->s.g = c[1] * 255.0f; o->s.b = c[2] * 255.0f; o->s.a = c[3] * 255.0f;
+                }
+                if (map_mode == 1 || map_mode == 2) tex_gen(map_mode, &rv, wn, &o->s);
+                else tex_coords(&rv, &o->s);
+                to_clip(wp, o->clip);
+                if (o->clip[3] > W_EPS) to_screen(o->clip, &o->s);
+                else o->s.w = 0;
             }
-            if (lit) {
-                const float in[4] = { o->s.r / 255.0f, o->s.g / 255.0f, o->s.b / 255.0f, o->s.a / 255.0f };
-                float c[4];
-                psp_ge_light(&light, in, wp, wn, c);
-                o->s.r = c[0] * 255.0f; o->s.g = c[1] * 255.0f; o->s.b = c[2] * 255.0f; o->s.a = c[3] * 255.0f;
-            }
-            if (map_mode == 1 || map_mode == 2) tex_gen(map_mode, &rv, wn, &o->s);
-            else tex_coords(&rv, &o->s);
-            to_clip(wp, o->clip);
-            if (o->clip[3] > W_EPS) to_screen(o->clip, &o->s);
-            else o->s.w = 0;
         }
     }
+    if (fast && g_vverify) vverify_draw(vt, &L, n, vaddr, iaddr, itype, skin, lit, &light, buf);
     if (g_clock) {
         uint32_t kind = skin ? VT_NWEIGHT(vt) : 0;
         if (lit) {
