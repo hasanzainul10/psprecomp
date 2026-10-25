@@ -1400,8 +1400,33 @@ static void dump_draw(uint32_t type, uint32_t n, const pvtx *buf) {
 }
 
 /* A PRIM count is 16 bits, so one buffer holds any primitive whole --
- * strips and fans never need stitching across batches. */
-static pvtx g_vbuf[65536];
+ * strips and fans never need stitching across batches.
+ *
+ * On the 3DS the app has ~94 MB for everything, and three such buffers
+ * (this one and the stereo ones, g_lbuf / g_ebuf) are 10.5 MB. There they
+ * start empty and grow to the largest primitive actually drawn; PVTX_GET
+ * returns NULL only if that growth fails (the draw is then dropped).
+ * Elsewhere they stay the static arrays they always were. */
+#ifdef PSPRECOMP_3DS
+typedef struct { pvtx *p; uint32_t cap; } pvtx_grow;
+static pvtx *pvtx_need(pvtx_grow *g, uint32_t n) {
+    if (n > g->cap) {
+        uint32_t c = 1024;
+        while (c < n) c <<= 1;
+        pvtx *q = (pvtx *)realloc(g->p, (size_t)c * sizeof *q);
+        if (!q) { fprintf(stderr, "gpu: no memory for %u vertices\n", (unsigned)n); return NULL; }
+        g->p = q;
+        g->cap = c;
+    }
+    return g->p;
+}
+#  define PVTX_BUF(name)    static pvtx_grow name##_grow
+#  define PVTX_GET(name, n) pvtx_need(&name##_grow, (n))
+#else
+#  define PVTX_BUF(name)    static pvtx name[65536]
+#  define PVTX_GET(name, n) (name)
+#endif
+PVTX_BUF(g_vbuf);
 static int g_verify = -1;
 static void rasterize(uint32_t type, const pvtx *buf, uint32_t n);
 static void verify_rasterize(uint32_t type, const pvtx *buf, uint32_t n);
@@ -1416,7 +1441,7 @@ static uint64_t g_st_dropped;              /* ST_DROP draws (st_screen_extruded)
 static void hud_scissor_restore(void);
 static FILE *g_st_trace;                 /* psp_gpu_stereo_trace (below) */
 static int   g_st_trace_on;
-static pvtx  g_lbuf[65536];
+PVTX_BUF(g_lbuf);
 static const pvtx *stereo_mono(const pvtx *buf, uint32_t n, int shift);
 static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n, int shift);
 static psp_gpu_stereo g_stereo;
@@ -1476,10 +1501,11 @@ static void gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iad
     if (g_null_backend()) return;
     setup_draw();
 
-    pvtx *buf = g_vbuf;
     const int morph_stride = L.stride * (int)VT_MORPH(vt);
     const int itype = (int)VT_INDEX(vt);
     const uint32_t n = count;
+    pvtx *buf = PVTX_GET(g_vbuf, n);
+    if (!buf) return;
 
     /* Transformed geometry: skinning (with a weight format), lighting and
      * generated texture coordinates, all in ge_vertex.c. */
@@ -2048,7 +2074,7 @@ static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n) {
  * position (-c) plus the off-axis shift (c * dist / D) that puts distance D
  * at zero disparity. In clip space that is that much of PROJ's first column.
  * Skinning, lighting and texture coordinates are not redone. */
-static pvtx  g_ebuf[65536];
+PVTX_BUF(g_ebuf);
 static float g_stereo_tan;
 static uint64_t g_eye_draws;
 
@@ -2614,9 +2640,10 @@ static void st_trace_draw(uint32_t type, const pvtx *buf, uint32_t n, int shift)
     st_bbox(buf, n, before);
     memcpy(after, before, sizeof after);
     int sc[4] = { g_sx0, g_sy0, g_sx1, g_sy1 };
-    if ((shift == ST_HUD || shift == ST_FX) && n <= 65536) {
-        eye_shift(buf, g_lbuf, n, 0, shift);
-        st_bbox(g_lbuf, n, after);
+    pvtx *lb = (shift == ST_HUD || shift == ST_FX) && n <= 65536 ? PVTX_GET(g_lbuf, n) : NULL;
+    if (lb) {
+        eye_shift(buf, lb, n, 0, shift);
+        st_bbox(lb, n, after);
         if (shift == ST_HUD) {
             hud_scissor(buf, n, 0);
             sc[0] = g_sx0; sc[1] = g_sy0; sc[2] = g_sx1; sc[3] = g_sy1;
@@ -2667,12 +2694,14 @@ static void eye_shift(const pvtx *buf, pvtx *out, uint32_t n, int eye, int mode)
 
 /* mono_is_left: the game's own picture is the left eye's, so the GPU draws
  * two pictures instead of three. */
-static pvtx g_lbuf[65536];
+PVTX_BUF(g_lbuf);
 static const pvtx *stereo_mono(const pvtx *buf, uint32_t n, int shift) {
     if (shift == ST_SAME || shift == ST_PANEL || !g_stereo.mono_is_left) return buf;
+    pvtx *lb = PVTX_GET(g_lbuf, n);
+    if (!lb) return buf;
     if (shift == ST_HUD) hud_scissor(buf, n, 0);        /* undone after hw_draw */
-    eye_shift(buf, g_lbuf, n, 0, shift);
-    return g_lbuf;
+    eye_shift(buf, lb, n, 0, shift);
+    return lb;
 }
 
 /* ST_PANEL: the draw as the game made it, to the backend's HUD picture. */
@@ -2694,12 +2723,14 @@ static void hw_draw_eyes(uint32_t type, const pvtx *buf, uint32_t n, int shift) 
         for (int eye = first; eye < 2; eye++) { g_hw->draw_eye(eye, &st, g_hwv, g_hwn); g_eye_draws++; }
         return;
     }
+    pvtx *eb = PVTX_GET(g_ebuf, n);
+    if (!eb) return;
     for (int eye = first; eye < 2; eye++) {
         if (shift == ST_HUD) { hud_scissor(buf, n, eye); fill_hw_state(&st); }
-        eye_shift(buf, g_ebuf, n, eye, shift);
+        eye_shift(buf, eb, n, eye, shift);
         g_hwn = 0;
-        if (type <= 2) collect_points_lines(type, g_ebuf, n);
-        else if (type <= 6) { g_collect = 1; rasterize_rows(type, g_ebuf, n); g_collect = 0; }
+        if (type <= 2) collect_points_lines(type, eb, n);
+        else if (type <= 6) { g_collect = 1; rasterize_rows(type, eb, n); g_collect = 0; }
         if (g_hwn) { g_hw->draw_eye(eye, &st, g_hwv, g_hwn); g_eye_draws++; }
         if (g_st_sc_set) { hud_scissor_restore(); fill_hw_state(&st); }
     }

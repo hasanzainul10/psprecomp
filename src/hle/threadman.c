@@ -158,15 +158,29 @@ static const char *const WAIT_NAME[] = {
 /* Host stack per PSP thread. Recompiled code nests one C frame per guest call
  * plus one per tail call, and the generated functions can have large frames,
  * so this is generous. Only `reserve` is address space; pages are committed
- * on demand. The 3DS commits what it allocates and has ~94 MB for
- * everything, so its stacks are real memory and much smaller (a build can
- * set PSPRECOMP_FIBER_STACK). */
+ * on demand.
+ *
+ * The 3DS commits what it allocates and has ~94 MB for everything, so its
+ * stacks are real memory, sized per thread (fiber_stack_size). Measured in
+ * Azahar at the title screen (host stack peak, and what the thread asked
+ * the PSP for): user_main 1,135 KB (48 KB), SOUND_THREAD 8 KB (12 KB),
+ * fio_th 3 KB (4 KB). Threads that ask the PSP for FIBER_BIG_GUEST_STACK or
+ * more get FIBER_STACK_RESERVE, the rest FIBER_STACK_SMALL (a build can set
+ * either: PSPRECOMP_FIBER_STACK, PSPRECOMP_FIBER_STACK_SMALL). */
 #if defined(PSPRECOMP_FIBER_STACK)
 #  define FIBER_STACK_RESERVE ((size_t)(PSPRECOMP_FIBER_STACK))
 #elif defined(PSPRECOMP_3DS)
-#  define FIBER_STACK_RESERVE (1u << 20)
+#  define FIBER_STACK_RESERVE ((size_t)4 << 20)
 #else
 #  define FIBER_STACK_RESERVE (64u << 20)
+#endif
+#ifdef PSPRECOMP_3DS
+#  ifdef PSPRECOMP_FIBER_STACK_SMALL
+#    define FIBER_STACK_SMALL ((size_t)(PSPRECOMP_FIBER_STACK_SMALL))
+#  else
+#    define FIBER_STACK_SMALL ((size_t)512 << 10)
+#  endif
+#  define FIBER_BIG_GUEST_STACK 0x8000u   /* 32 KB: user_main asks for 48 */
 #endif
 
 #if defined(_WIN32)
@@ -177,7 +191,7 @@ static fiber_t g_main_fiber;
  * stack pointer in *from, load `to`, pop its registers and return into it. A
  * new fiber's stack starts as if it had switched away at fiber_start, which
  * calls entry(arg) from the registers seeded below. */
-typedef struct asm_fiber { void *sp; void *stack; } asm_fiber;
+typedef struct asm_fiber { void *sp; void *stack; size_t size; } asm_fiber;
 typedef asm_fiber *fiber_t;
 static asm_fiber g_main_af;
 static fiber_t g_main_fiber = &g_main_af;
@@ -616,11 +630,17 @@ static int collect_waiters(int type, uint32_t id, uint32_t attr, psp_thread **ou
 }
 
 static int run_callbacks(psp_thread *t);
+#ifdef PSPRECOMP_3DS
+static void stack_guard_check(const psp_thread *t);
+#endif
 
 static void switch_to_main(void) {
 #if defined(_WIN32)
     SwitchToFiber(g_main_fiber);
 #elif defined(PSPRECOMP_ASM_FIBERS)
+#  ifdef PSPRECOMP_3DS
+    stack_guard_check(g_current);
+#  endif
     psp_fiber_switch(&g_current->fiber->sp, g_main_fiber->sp);
 #elif defined(PSPRECOMP_THREAD_FIBERS)
     hf_switch(g_current->fiber, g_main_fiber);
@@ -1001,6 +1021,57 @@ static void fiber_proc(int hi, int lo) {
 }
 #endif
 
+#ifdef PSPRECOMP_3DS
+/* The 3DS's fiber stacks are real allocations with nothing to catch an
+ * overflow. Each is filled with a pattern when made: the lowest STACK_GUARD
+ * bytes are checked whenever the thread hands control back, before and after
+ * the switch, so an overflow stops the program with the thread's name
+ * instead of corrupting what the scheduler resumes from (4 KB, so a large
+ * local array can't step over it). The untouched part gives each thread's
+ * peak use, which is what the sizes above come from. */
+#define STACK_FILL  0xA5
+#define STACK_GUARD 4096
+
+static size_t fiber_stack_size(const psp_thread *t) {
+    return t->stack_size >= FIBER_BIG_GUEST_STACK ? FIBER_STACK_RESERVE : FIBER_STACK_SMALL;
+}
+
+static size_t stack_peak(const asm_fiber *f) {
+    const uint8_t *p = (const uint8_t *)f->stack;
+    size_t i = 0;
+    while (i < f->size && p[i] == STACK_FILL) i++;
+    return f->size - i;
+}
+
+static void stack_guard_check(const psp_thread *t) {
+    const uint8_t *p = (const uint8_t *)t->fiber->stack;
+    for (int i = 0; i < STACK_GUARD; i++)
+        if (p[i] != STACK_FILL) {
+            fprintf(stderr, "psprecomp: thread '%s' overflowed its %u KB host stack"
+                    " (PSPRECOMP_FIBER_STACK / _SMALL)\n", t->name, (unsigned)(t->fiber->size >> 10));
+            fflush(stderr);
+            abort();
+        }
+}
+
+void psp_sched_stack_report(FILE *out) {
+    size_t most = 0, total = 0;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        const psp_thread *t = &g_thread[i];
+        if (!t->fiber) continue;
+        const size_t peak = stack_peak(t->fiber);
+        if (peak > most) most = peak;
+        total += t->fiber->size;
+        fprintf(out, "stack: %-31s %4u KB of %u (PSP stack %u KB)\n", t->name, (unsigned)(peak >> 10),
+                (unsigned)(t->fiber->size >> 10), (unsigned)(t->stack_size >> 10));
+    }
+    fprintf(out, "stack: deepest %u KB; %u KB of host stacks in all\n",
+            (unsigned)(most >> 10), (unsigned)(total >> 10));
+}
+#else
+#define fiber_stack_size(t) FIBER_STACK_RESERVE
+#endif
+
 static int fiber_create(psp_thread *t) {
 #if defined(_WIN32)
     t->fiber = CreateFiberEx(256 * 1024, FIBER_STACK_RESERVE, FIBER_FLAG_FLOAT_SWITCH,
@@ -1009,9 +1080,13 @@ static int fiber_create(psp_thread *t) {
 #elif defined(PSPRECOMP_ASM_FIBERS)
     asm_fiber *f = (asm_fiber *)calloc(1, sizeof *f);
     if (!f) return -1;
-    f->stack = malloc(FIBER_STACK_RESERVE);
+    f->size = fiber_stack_size(t);
+    f->stack = malloc(f->size);
     if (!f->stack) { free(f); return -1; }
-    f->sp = asm_seed(f->stack, FIBER_STACK_RESERVE, fiber_proc, t);
+#ifdef PSPRECOMP_3DS
+    memset(f->stack, STACK_FILL, f->size);              /* the guard and the peak (above) */
+#endif
+    f->sp = asm_seed(f->stack, f->size, fiber_proc, t);
     t->fiber = f;
     return 0;
 #elif defined(PSPRECOMP_THREAD_FIBERS)
@@ -1086,6 +1161,9 @@ static void run_thread(psp_thread *t) {
     SwitchToFiber(t->fiber);
 #elif defined(PSPRECOMP_ASM_FIBERS)
     psp_fiber_switch(&g_main_af.sp, t->fiber->sp);
+#  ifdef PSPRECOMP_3DS
+    stack_guard_check(t);
+#  endif
 #elif defined(PSPRECOMP_THREAD_FIBERS)
     hf_switch(g_main_fiber, t->fiber);
 #else

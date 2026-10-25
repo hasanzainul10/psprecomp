@@ -319,6 +319,10 @@ int      psp_sched_notify_callback(uint32_t cbid, uint32_t arg);
 /* The preemption point every firmware call ends with. */
 void     psp_sched_after_hle(void);
 void     psp_sched_dump(FILE *out);
+#ifdef PSPRECOMP_3DS
+/* Each PSP thread's peak use of its host stack (FIBER_STACK_RESERVE). */
+void     psp_sched_stack_report(FILE *out);
+#endif
 /* Call guest code as an interrupt handler would run (GE callbacks). */
 uint32_t psp_call_guest(uint32_t func, uint32_t a0, uint32_t a1, uint32_t a2);
 uint32_t psp_sched_call_interrupt(uint32_t func, uint32_t a0, uint32_t a1);
