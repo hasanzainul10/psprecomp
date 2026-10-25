@@ -9,13 +9,16 @@
 
 psp_memory psp_mem;
 uint64_t   psp_mem_bad_access;
+uint8_t   *psp_mem_fast_rd, *psp_mem_fast_wr;   /* PSPRECOMP_INLINE_MEM: see mem.h */
+
+static void fast_update(void);
 
 /* Watch writes to one address. "Which code writes this word" is a question
  * that came up repeatedly and could only be answered by guessing; the write
  * path is the one place that can answer it directly. */
 static uint32_t g_wwatch;
 static int g_whits;
-void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; }
+void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; fast_update(); }
 int psp_mem_watch_hits(void) { return g_whits; }
 
 static void (*g_watch_hook)(uint32_t addr, uint32_t value);
@@ -24,7 +27,7 @@ void psp_mem_set_watch_hook(void (*fn)(uint32_t addr, uint32_t value)) { g_watch
 /* Write trace: every guest write while switched on (a host brackets one
  * packet handler with it to see everything that handler stores). */
 static void (*g_wtrace)(uint32_t addr, uint32_t width, uint32_t value);
-void psp_mem_trace_writes(void (*fn)(uint32_t addr, uint32_t width, uint32_t value)) { g_wtrace = fn; }
+void psp_mem_trace_writes(void (*fn)(uint32_t addr, uint32_t width, uint32_t value)) { g_wtrace = fn; fast_update(); }
 
 static void note_write(uint32_t addr, uint32_t width, uint32_t value) {
     if (g_wtrace) g_wtrace(addr, width, value);
@@ -44,9 +47,10 @@ static uint32_t g_rwatch[MAX_RWATCH];
 static int g_rwatch_n;
 static void (*g_rwatch_hook)(uint32_t watched, uint32_t addr);
 void psp_mem_watch_read(uint32_t addr) {
-    if (!addr) { g_rwatch_n = 0; return; }
+    if (!addr) { g_rwatch_n = 0; fast_update(); return; }
     for (int i = 0; i < g_rwatch_n; i++) if (g_rwatch[i] == addr) return;
     if (g_rwatch_n < MAX_RWATCH) g_rwatch[g_rwatch_n++] = addr;
+    fast_update();
 }
 void psp_mem_set_read_watch_hook(void (*fn)(uint32_t watched, uint32_t addr)) { g_rwatch_hook = fn; }
 
@@ -101,6 +105,7 @@ int psp_mem_init(void) {
         return -1;
     }
     psp_mem_bad_access = 0;
+    fast_update();
     return 0;
 }
 
@@ -109,6 +114,7 @@ void psp_mem_free(void) {
     free(psp_mem.vram);
     free(psp_mem.scratch);
     psp_mem.ram = psp_mem.vram = psp_mem.scratch = NULL;
+    fast_update();
 }
 
 /* The loaded module image, for a PRX linked outside the RAM window. */
@@ -118,10 +124,19 @@ static uint32_t g_module_base, g_module_size;
 int psp_mem_map_module(uint32_t base, uint32_t size) {
     free(g_module);
     g_module = (uint8_t *)calloc(1, size ? size : 1);
-    if (!g_module) { g_module_size = 0; return -1; }
+    if (!g_module) { g_module_size = 0; fast_update(); return -1; }
     g_module_base = base;
     g_module_size = size;
+    fast_update();
     return 0;
+}
+
+/* The inline main-RAM path (mem.h) only while it gives what the functions
+ * below would: no module mapped over the address space, and no read watch
+ * (reads) / write watch or trace (writes). */
+static void fast_update(void) {
+    psp_mem_fast_rd = psp_mem.ram && !g_module_size && !g_rwatch_n ? psp_mem.ram : NULL;
+    psp_mem_fast_wr = psp_mem.ram && !g_module_size && !g_wwatch && !g_wtrace ? psp_mem.ram : NULL;
 }
 
 static void (*g_vram_hook)(uint32_t off, uint32_t size);
