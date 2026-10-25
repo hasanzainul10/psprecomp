@@ -220,6 +220,11 @@ int  psp_gpu_stereo_probe_result(float out[6]);
 void psp_gpu_set_backend(const psp_gpu_backend *be);   /* NULL = software */
 const psp_gpu_backend *psp_gpu_get_backend(void);
 
+/* Time spent in prims (vertex work plus the backend's draw), in the ticks of
+ * `now` (NULL: not measured, the default). */
+void psp_gpu_set_clock(uint64_t (*now)(void));
+uint64_t psp_gpu_prim_ticks(void);
+
 /* GE sync point (sceGeDrawSync/ListSync): bring emulated VRAM up to date with
  * the hardware backend's render targets, and have the targets re-check VRAM
  * for CPU writes before their next draw. No-op for the software rasterizer. */

@@ -1448,9 +1448,25 @@ static psp_gpu_stereo g_stereo;
 static int g_hw_ok;                       /* the last hw_draw went to the backend (not software) */
 
 static void gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr);
+static void gpu_prim_moved(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr);
+
+/* psp_gpu_set_clock: the time spent in prims (vertex work and the backend's
+ * draw), for a host's frame-time breakdown. */
+static uint64_t (*g_clock)(void);
+static uint64_t g_prim_ticks;
+void psp_gpu_set_clock(uint64_t (*now)(void)) { g_clock = now; }
+uint64_t psp_gpu_prim_ticks(void) { return g_prim_ticks; }
+
+void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr) {
+    if (!g_clock) { gpu_prim_moved(type, count, vaddr, iaddr); return; }
+    const uint64_t t0 = g_clock();
+    gpu_prim_moved(type, count, vaddr, iaddr);
+    g_prim_ticks += g_clock() - t0;
+}
+
 /* A rigid mesh at the marked place drawn moved (psp_gpu_set_rigid_move):
  * WORLD = m x WORLD for this draw only, with the same test as the drop. */
-void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr) {
+static void gpu_prim_moved(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr) {
     const uint32_t vt = R[0x12];
     if (g_rigid_move && !VT_THROUGH(vt) && fabsf(g_proj[11]) > 1e-6f &&
         g_world[9] * g_world[9] + g_world[10] * g_world[10] + g_world[11] * g_world[11] > 0.25f) {
