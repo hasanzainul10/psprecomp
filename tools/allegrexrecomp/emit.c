@@ -28,6 +28,7 @@ typedef struct {
     const uint32_t *hooks; /* functions with a run-time hook (emit_opts) */
     int nhooks;
     int *scc;              /* per function index: tail-call cycle id, 0 = none (see compute_tail_cycles) */
+    uint8_t *scc_cont;     /* per word: a continuation label reached through psp_scc_next (scc_fall) */
     int has_entry_switch;  /* the current body re-enters its entry switch on a computed jump */
 } ectx;
 
@@ -161,6 +162,25 @@ static int is_hooked(const ectx *c, uint32_t addr) {
     return 0;
 }
 
+/* The function index whose body runs when control falls into `a`: the function
+ * at `a`, or, when `a` is a continuation label inside another body (the start
+ * of an interior gap or the end of a body, see mark_continuations), the body
+ * that owns it. -1 when there is none or it is hooked.
+ *
+ * Falling into a continuation label used to be no edge here and a dispatch
+ * call in the emitter, so a loop through one grew the host stack a few frames
+ * per pass. Observed: the decoder at 0x08DE0E10 falls into 0x08DE0E0C (owned
+ * by 0x08DE0EAC) once per literal byte; a large file nested 177,000 calls
+ * (16 MB on PC) and overflowed the 3DS's 4 MB fiber stack in town. */
+static int fall_target(const ectx *c, uint32_t a) {
+    const a_analysis *an = c->an;
+    const a_func *t = NULL;
+    if (is_function(an, a)) t = func_at(an, a);
+    else if (a_in_range(an, a) && an->owner[widx(an, a)] != A_NO_OWNER) t = func_at(an, an->owner[widx(an, a)]);
+    if (!t || is_hooked(c, t->addr)) return -1;
+    return (int)(t - an->funcs);
+}
+
 /* The function index an emitted tail transfer from `owner` to `t` would call,
  * or -1 when that transfer is not a cross-function call. Mirrors the emitter. */
 static int tail_edge(const ectx *c, uint32_t owner, const a_insn *in) {
@@ -198,10 +218,7 @@ static void compute_tail_cycles(ectx *c) {
         for (uint32_t a = fn->start; a <= fn->end; a += 4) {
             int t = -1;
             if (a == fn->end || !owned_by(an, a, fn->addr)) {
-                if (!terminal && is_function(an, a)) {
-                    const a_func *tf = func_at(an, a);
-                    if (tf && !is_hooked(c, tf->addr)) t = (int)(tf - an->funcs);
-                }
+                if (!terminal) t = fall_target(c, a);
                 terminal = 1;
             } else {
                 a_insn in;
@@ -271,6 +288,16 @@ static int scc_transfer(const ectx *c, uint32_t target) {
     if (!t) return 0;
     const int ti = (int)(t - c->an->funcs);
     return c->scc[cur] != 0 && c->scc[cur] == c->scc[ti];
+}
+
+/* scc_transfer for falling into `a`, which may be a continuation label inside
+ * another body (fall_target); such a label gets its own psp_scc_step case. */
+static int scc_fall(ectx *c, uint32_t a) {
+    if (!c->scc) return 0;
+    const int cur = (int)(c->func - c->an->funcs), t = fall_target(c, a);
+    if (t < 0 || c->scc[cur] == 0 || c->scc[cur] != c->scc[t]) return 0;
+    if (!is_function(c->an, a)) c->scc_cont[widx(c->an, a)] = 1;
+    return 1;
 }
 
 /* Does `f` contain a call whose delay slot reloads $ra (`jal g ; lw $ra, ..`)?
@@ -1314,7 +1341,7 @@ static void emit_function(ectx *c, const a_func *fn) {
              * after the gap is reachable through its own entry. */
             if (!last_terminal) {
                 fprintf(f, "    /* falls into 0x%08X, owned by another function */\n", a);
-                if (is_function(an, a) && scc_transfer(c, a))
+                if (scc_fall(c, a))
                     fprintf(f, "    psp_scc_next = 0x%08Xu;  /* tail transfer within a cycle */\n    return;\n", a);
                 else {
                     emit_static_call(c, a);
@@ -1537,7 +1564,7 @@ static void emit_function(ectx *c, const a_func *fn) {
         uint32_t next = fn->end;
         if (is_function(an, next)) {
             fprintf(f, "    /* falls through into the next function */\n");
-            if (scc_transfer(c, next)) fprintf(f, "    psp_scc_next = 0x%08Xu;  /* tail transfer within a cycle */\n", next);
+            if (scc_fall(c, next)) fprintf(f, "    psp_scc_next = 0x%08Xu;  /* tail transfer within a cycle */\n", next);
             else fprintf(f, "    psp_func_%08X();\n", next);
         } else if (a_in_range(an, next) && an->owner[widx(an, next)] != A_NO_OWNER) {
             /* ...or into the middle of one. Discovery split a routine and this
@@ -1547,7 +1574,8 @@ static void emit_function(ectx *c, const a_func *fn) {
              * the callee-saved registers never restored. */
             fprintf(f, "    /* continues at 0x%08X, inside psp_func_%08X */\n",
                     next, an->owner[widx(an, next)]);
-            fprintf(f, "    psp_dispatch(0x%08Xu);\n", next);
+            if (scc_fall(c, next)) fprintf(f, "    psp_scc_next = 0x%08Xu;  /* tail transfer within a cycle */\n", next);
+            else fprintf(f, "    psp_dispatch(0x%08Xu);\n", next);
         }
     }
     fprintf(f, "}\n");
@@ -1752,10 +1780,11 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     c.an = an;
     c.is_label = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
     c.is_slot  = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
+    c.scc_cont = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
     c.entries = NULL;
     c.nentries = c.centries = 0;
-    if (!c.is_label || !c.is_slot) {
-        free(c.is_label); free(c.is_slot); fclose(f);
+    if (!c.is_label || !c.is_slot || !c.scc_cont) {
+        free(c.is_label); free(c.is_slot); free(c.scc_cont); fclose(f);
         return -1;
     }
 
@@ -1780,6 +1809,12 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     fprintf(f, "\nstatic void psp_scc_step(uint32_t t) {\n    switch (t) {\n");
     for (int i = 0; c.scc && i < an->nfuncs; i++)
         if (c.scc[i]) fprintf(f, "    case 0x%08Xu: psp_step_%08X(); break;\n", an->funcs[i].addr, an->funcs[i].addr);
+    /* continuation labels (scc_fall): the owning body, entered at the label; a
+     * delay-slot label has no case in that body's switch, so it keeps dispatch */
+    for (uint32_t w = 0; w < an->nwords; w++)
+        if (c.scc_cont[w] && !c.is_slot[w])
+            fprintf(f, "    case 0x%08Xu: psp_body_%08X(0x%08Xu); break;\n",
+                    an->base + w * 4, an->owner[w], an->base + w * 4);
     fprintf(f, "    default: psp_dispatch(t); break;\n    }\n}\n");
     free(c.scc);
 
@@ -1810,6 +1845,7 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
 
     free(c.is_label);
     free(c.is_slot);
+    free(c.scc_cont);
     free(c.entries);
     fclose(f);
 
